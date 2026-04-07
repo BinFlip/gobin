@@ -10,6 +10,7 @@ repository = "https://github.com/BinFlip/gobin"
 readme = "README.md"
 keywords = ["golang", "go", "parser", "reverse-engineering", "binary-analysis"]
 categories = ["parser-implementations"]
+exclude = ["tests/samples/"]
 
 [dependencies]
 goblin = "0.10.5"
