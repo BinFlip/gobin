@@ -556,7 +556,7 @@ fn reject_non_go_elf_header() {
 #[test]
 fn function_info_short_name() {
     let f = FunctionInfo {
-        name: "net/http.(*Client).Do".into(),
+        name: "net/http.(*Client).Do",
         entry_offset: 0,
         args_size: 0,
         start_line: 0,
@@ -581,7 +581,7 @@ fn function_info_short_name() {
 #[test]
 fn function_info_closure() {
     let f = FunctionInfo {
-        name: "main.main.func1".into(),
+        name: "main.main.func1",
         entry_offset: 0,
         args_size: 0,
         start_line: 0,
@@ -605,7 +605,7 @@ fn function_info_closure() {
 #[test]
 fn function_info_func_id_names() {
     let f = FunctionInfo {
-        name: "runtime.goexit".into(),
+        name: "runtime.goexit",
         entry_offset: 0,
         args_size: 0,
         start_line: 0,
@@ -625,7 +625,7 @@ fn function_info_func_id_names() {
     assert_eq!(f.func_id_name(), Some("goexit"));
 
     let normal = FunctionInfo {
-        name: "main.main".into(),
+        name: "main.main",
         entry_offset: 0,
         args_size: 0,
         start_line: 0,

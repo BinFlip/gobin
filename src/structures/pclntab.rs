@@ -556,10 +556,10 @@ fn try_parse_at(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
 fn scan_for_magic(data: &[u8]) -> Option<ParsedPclntab<'_>> {
     for offset in (0..data.len().saturating_sub(72)).step_by(4) {
         let magic: [u8; 4] = data[offset..offset + 4].try_into().ok()?;
-        if MAGICS.iter().any(|(m, _)| *m == magic)
-            && let Some(parsed) = try_parse_at(&data[offset..], offset)
-        {
-            return Some(parsed);
+        if MAGICS.iter().any(|(m, _)| *m == magic) {
+            if let Some(parsed) = try_parse_at(&data[offset..], offset) {
+                return Some(parsed);
+            }
         }
     }
     None

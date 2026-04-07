@@ -330,7 +330,7 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                     (false, true) => return std::cmp::Ordering::Less,
                     _ => {}
                 }
-                a.name.cmp(&b.name)
+                a.name.cmp(b.name)
             });
 
             for f in sorted {

@@ -69,7 +69,7 @@ mod tests {
     fn decode_varint_length() {
         // flags=0, len=128 (varint: 0x80 0x01), then 128 'x' bytes
         let mut data = vec![0x00, 0x80, 0x01];
-        data.extend(std::iter::repeat(b'x').take(128));
+        data.extend(std::iter::repeat_n(b'x', 128));
         assert_eq!(decode_name(&data), Some(&"x".repeat(128)[..]));
     }
 

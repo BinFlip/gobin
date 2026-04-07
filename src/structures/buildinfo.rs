@@ -290,11 +290,10 @@ pub fn find_version_string(data: &[u8]) -> Option<String> {
                     break;
                 }
             }
-            if let Ok(s) = std::str::from_utf8(&data[start..end])
-                && s.len() >= 5
-                && s[4..].starts_with(|c: char| c.is_ascii_digit())
-            {
-                return Some(s.to_string());
+            if let Ok(s) = std::str::from_utf8(&data[start..end]) {
+                if s.len() >= 5 && s[4..].starts_with(|c: char| c.is_ascii_digit()) {
+                    return Some(s.to_string());
+                }
             }
             pos = start + 4;
         } else {

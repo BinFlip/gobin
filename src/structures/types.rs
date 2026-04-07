@@ -121,12 +121,12 @@ impl GoType {
                 s = rest;
             }
         }
-        if s.starts_with('[')
-            && let Some(bracket_end) = s.find(']')
-        {
-            s = &s[bracket_end + 1..];
-            while let Some(rest) = s.strip_prefix('*') {
-                s = rest;
+        if s.starts_with('[') {
+            if let Some(bracket_end) = s.find(']') {
+                s = &s[bracket_end + 1..];
+                while let Some(rest) = s.strip_prefix('*') {
+                    s = rest;
+                }
             }
         }
         if let Some(rest) = s.strip_prefix("map[") {
@@ -320,13 +320,13 @@ pub fn extract_types(
     }
 
     // Strategy 1b: use typelinks from moduledata (Go 1.16-1.26 PE binaries)
-    if let Some(ref tl_slice) = md.typelinks
-        && let Some(tl_file_off) = ctx.va_to_file(tl_slice.ptr)
-    {
-        let tl_byte_len = (tl_slice.len as usize) * 4;
-        if tl_file_off + tl_byte_len <= data.len() {
-            let tl_data = &data[tl_file_off..tl_file_off + tl_byte_len];
-            return extract_via_typelinks(data, tl_data, md.types, ptr_size, ctx);
+    if let Some(ref tl_slice) = md.typelinks {
+        if let Some(tl_file_off) = ctx.va_to_file(tl_slice.ptr) {
+            let tl_byte_len = (tl_slice.len as usize) * 4;
+            if tl_file_off + tl_byte_len <= data.len() {
+                let tl_data = &data[tl_file_off..tl_file_off + tl_byte_len];
+                return extract_via_typelinks(data, tl_data, md.types, ptr_size, ctx);
+            }
         }
     }
 
@@ -408,10 +408,10 @@ fn extract_via_typelinks(
         let type_off = i32::from_le_bytes(tl_data[i * 4..(i + 1) * 4].try_into().unwrap());
         let type_va = (types_base_va as i64 + type_off as i64) as u64;
 
-        if let Some(file_off) = ctx.va_to_file(type_va)
-            && let Some(go_type) = parse_type_at(data, file_off, types_base_va, ps, ctx)
-        {
-            types.push(go_type);
+        if let Some(file_off) = ctx.va_to_file(type_va) {
+            if let Some(go_type) = parse_type_at(data, file_off, types_base_va, ps, ctx) {
+                types.push(go_type);
+            }
         }
     }
 
