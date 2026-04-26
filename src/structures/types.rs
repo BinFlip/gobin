@@ -49,7 +49,7 @@ use crate::{
 ///
 /// All string fields borrow from the underlying binary data via the lifetime
 /// `'a`. To keep results past the binary's lifetime, copy individual fields
-/// or use [`GoType::to_owned`].
+/// or `.clone()` and convert borrows to owned `String`s at the boundary.
 #[derive(Debug, Clone)]
 pub struct GoType<'a> {
     /// Full type name as stored in the binary (e.g. `"*net/http.Client"`).

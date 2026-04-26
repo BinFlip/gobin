@@ -523,8 +523,8 @@ impl<'a> GoBinary<'a> {
     ///
     /// Uses the `.typelink` section (an array of `int32` offsets) and the
     /// `abi.Type` struct layout to recover every type the binary exposes to
-    /// reflection. Each yielded [`GoType`] includes its name, kind, size, flags,
-    /// kind-specific detail and resolved methods.
+    /// reflection. Each yielded [`types::GoType`] includes its name, kind, size,
+    /// flags, kind-specific detail and resolved methods.
     ///
     /// Yields zero items if the required sections (`.typelink` / `.go.module`)
     /// or moduledata are not present. Adversarial input cannot panic the
