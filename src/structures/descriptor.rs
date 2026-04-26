@@ -19,6 +19,7 @@ use crate::structures::{
     method::{GoImethod, GoMethod},
     structtype::{GoStructField, StructTypeExtra},
     uncommon::UncommonType,
+    util::align_up,
 };
 
 /// Compute the total descriptor size for a type, equivalent to Go's
@@ -30,31 +31,39 @@ pub fn descriptor_size(type_data: &[u8], abi_type: &AbiType, ps: u8) -> Option<u
     let base_sz = AbiType::size(ps);
 
     let (concrete_sz, var_sz) = match abi_type.kind() {
-        kind::ARRAY => (base_sz + ArrayTypeExtra::size(ps), 0),
-        kind::CHAN => (base_sz + ChanTypeExtra::size(ps), 0),
+        kind::ARRAY => (base_sz.checked_add(ArrayTypeExtra::size(ps))?, 0usize),
+        kind::CHAN => (base_sz.checked_add(ChanTypeExtra::size(ps))?, 0),
         kind::FUNC => {
             let extra_off = base_sz;
             let extra = FuncTypeExtra::parse(type_data.get(extra_off..)?)?;
-            let param_count = extra.in_count as usize + extra.num_out() as usize;
-            (base_sz + FuncTypeExtra::SIZE, param_count * p)
+            let param_count = (extra.in_count as usize).checked_add(extra.num_out() as usize)?;
+            // Params follow FuncTypeExtra after ptr-aligned padding.
+            let after_extra = base_sz.checked_add(FuncTypeExtra::SIZE)?;
+            let params_off = align_up(after_extra, p)?;
+            let pad = params_off.checked_sub(after_extra)?;
+            let extra_total = FuncTypeExtra::SIZE.checked_add(pad)?;
+            (
+                base_sz.checked_add(extra_total)?,
+                param_count.checked_mul(p)?,
+            )
         }
         kind::INTERFACE => {
             let extra_off = base_sz;
             let extra = InterfaceTypeExtra::parse(type_data.get(extra_off..)?, ps)?;
             (
-                base_sz + InterfaceTypeExtra::size(ps),
-                extra.methods.len as usize * GoImethod::SIZE,
+                base_sz.checked_add(InterfaceTypeExtra::size(ps))?,
+                (extra.methods.len as usize).checked_mul(GoImethod::SIZE)?,
             )
         }
-        kind::MAP => (base_sz + MapTypeExtra::size(ps), 0),
-        kind::POINTER => (base_sz + ElemTypeExtra::size(ps), 0),
-        kind::SLICE => (base_sz + ElemTypeExtra::size(ps), 0),
+        kind::MAP => (base_sz.checked_add(MapTypeExtra::size(ps))?, 0),
+        kind::POINTER => (base_sz.checked_add(ElemTypeExtra::size(ps))?, 0),
+        kind::SLICE => (base_sz.checked_add(ElemTypeExtra::size(ps))?, 0),
         kind::STRUCT => {
             let extra_off = base_sz;
             let extra = StructTypeExtra::parse(type_data.get(extra_off..)?, ps)?;
             (
-                base_sz + StructTypeExtra::size(ps),
-                extra.fields.len as usize * GoStructField::size(ps),
+                base_sz.checked_add(StructTypeExtra::size(ps))?,
+                (extra.fields.len as usize).checked_mul(GoStructField::size(ps))?,
             )
         }
         kind::BOOL
@@ -83,14 +92,14 @@ pub fn descriptor_size(type_data: &[u8], abi_type: &AbiType, ps: u8) -> Option<u
     let mcount = if abi_type.has_uncommon() {
         let ut_off = concrete_sz;
         let ut = UncommonType::parse(type_data.get(ut_off..)?)?;
-        total += UncommonType::SIZE;
+        total = total.checked_add(UncommonType::SIZE)?;
         ut.mcount as usize
     } else {
         0
     };
 
-    total += var_sz;
-    total += mcount * GoMethod::SIZE;
+    total = total.checked_add(var_sz)?;
+    total = total.checked_add(mcount.checked_mul(GoMethod::SIZE)?)?;
 
     Some(total)
 }

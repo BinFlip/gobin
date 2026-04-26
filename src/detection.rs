@@ -45,6 +45,130 @@ pub enum Confidence {
     High,
 }
 
+/// Structured detection report produced during [`crate::GoBinary::parse`] /
+/// [`crate::GoBinary::try_parse`].
+///
+/// Wraps the headline [`Confidence`] tier with a list of individual signals
+/// observed during analysis, so callers can answer "*why* did this score
+/// Medium?" without re-running detection. Used for analyst-facing diagnostics
+/// (the `examples/dump --explain` mode) and for upstream bug reports.
+#[derive(Debug, Clone)]
+pub struct ConfidenceReport {
+    /// Final confidence tier.
+    pub tier: Confidence,
+    /// Individual signals collected during detection, in the order observed.
+    pub signals: Vec<ConfidenceSignal>,
+}
+
+impl ConfidenceReport {
+    /// Construct an empty report at [`Confidence::None`].
+    pub fn empty() -> Self {
+        Self {
+            tier: Confidence::None,
+            signals: Vec::new(),
+        }
+    }
+
+    /// Append a signal to the report.
+    pub fn push(&mut self, signal: ConfidenceSignal) {
+        self.signals.push(signal);
+    }
+
+    /// Raise the tier if the new tier is strictly higher.
+    pub fn raise_to(&mut self, tier: Confidence) {
+        if tier > self.tier {
+            self.tier = tier;
+        }
+    }
+}
+
+/// One observation made during Go-binary detection.
+///
+/// **Sealed**: this enum is exhaustively defined and not marked
+/// `#[non_exhaustive]`. Adding a variant is a breaking API change so callers
+/// can rely on exhaustive match without `_ =>` arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfidenceSignal {
+    /// `.gopclntab` / `__gopclntab` section was present in the binary headers.
+    GopclntabSectionPresent,
+    /// `.go.buildinfo` / `__go_buildinfo` section was present.
+    BuildinfoSectionPresent,
+    /// ELF `.note.go.buildid` (or `Go\0\0` note marker) was present.
+    BuildidNotePresent,
+    /// Build ID raw marker (`\xff Go build ID:`) was found.
+    BuildIdMarkerFound,
+    /// Build info blob was successfully parsed.
+    BuildinfoParsed,
+    /// Build info parse failed for the given reason.
+    BuildinfoMissing {
+        /// Short, static reason string.
+        reason: &'static str,
+    },
+    /// pclntab was successfully parsed; carries the format version and function count.
+    PclntabParsed {
+        /// Detected pclntab format version.
+        version: crate::structures::PclntabVersion,
+        /// Number of functions decoded from the pclntab.
+        nfunc: usize,
+    },
+    /// pclntab could not be parsed for the given reason.
+    PclntabMissing {
+        /// Short, static reason string.
+        reason: &'static str,
+    },
+    /// A Go version string was located.
+    GoVersionString {
+        /// The version string (e.g. `"go1.26.1"`).
+        version: String,
+        /// Where the version was sourced from.
+        source: VersionSource,
+    },
+    /// Heuristic runtime string patterns matched at low confidence.
+    HeuristicStringsMatched {
+        /// Number of distinct patterns matched.
+        hits: usize,
+    },
+}
+
+/// Where a Go version string was extracted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSource {
+    /// Parsed from the structured build info blob.
+    BuildInfoBlob,
+    /// Found by scanning binary data for `go1.<digits>` patterns.
+    StringScan,
+}
+
+/// Reason a binary could not be parsed as Go.
+///
+/// **Sealed** for the same reason as [`ConfidenceSignal`].
+#[derive(Debug, Clone)]
+pub enum ParseError {
+    /// No Go-specific indicators were found above the [`Confidence::None`]
+    /// threshold. The attached report records every signal that *was* checked,
+    /// useful for surfacing "what was missing" to an analyst.
+    NotAGoBinary {
+        /// The detection report at the point of failure.
+        report: ConfidenceReport,
+    },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAGoBinary { report } => {
+                write!(
+                    f,
+                    "not a Go binary: no Go indicators found ({} signals checked)",
+                    report.signals.len()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// Strings that appear in virtually every Go binary.
 ///
 /// These are function names stored in the pclntab `funcnametab` and runtime error
@@ -72,16 +196,18 @@ const HEURISTIC_THRESHOLD: usize = 3;
 /// 3 distinct patterns are found, which makes false positives
 /// unlikely (a non-Go binary would need to embed multiple Go-specific error messages).
 pub fn heuristic_check(data: &[u8]) -> bool {
-    let mut hits = 0;
-    for pattern in HEURISTIC_PATTERNS {
-        if find_bytes(data, pattern).is_some() {
-            hits += 1;
-            if hits >= HEURISTIC_THRESHOLD {
-                return true;
-            }
-        }
-    }
-    false
+    heuristic_hits(data) >= HEURISTIC_THRESHOLD
+}
+
+/// Count how many heuristic patterns match in `data`.
+///
+/// Used by [`crate::GoBinary::try_parse`] to attach an exact hit count to the
+/// [`ConfidenceSignal::HeuristicStringsMatched`] signal.
+pub fn heuristic_hits(data: &[u8]) -> usize {
+    HEURISTIC_PATTERNS
+        .iter()
+        .filter(|p| find_bytes(data, p).is_some())
+        .count()
 }
 
 /// Find the first occurrence of `needle` in `haystack`.

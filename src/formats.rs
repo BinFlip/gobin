@@ -166,7 +166,7 @@ impl<'a> BinaryContext<'a> {
                         if phdr.p_type == PT_NOTE && phdr.p_filesz > 0 {
                             let offset = phdr.p_offset as usize;
                             let size = phdr.p_filesz as usize;
-                            if offset + size <= data.len() {
+                            if offset.checked_add(size).is_some_and(|e| e <= data.len()) {
                                 elf_note_segments.push((offset, size));
                             }
                         }
@@ -197,7 +197,7 @@ impl<'a> BinaryContext<'a> {
                 goblin::Object::PE(pe) => {
                     let image_base = pe.image_base;
                     for section in &pe.sections {
-                        let va = image_base + section.virtual_address as u64;
+                        let va = image_base.saturating_add(section.virtual_address as u64);
                         let file_off = section.pointer_to_raw_data as u64;
                         let size = section.size_of_raw_data as u64;
                         if size > 0 {
@@ -260,8 +260,11 @@ impl<'a> BinaryContext<'a> {
     /// Translate a virtual address to a file byte offset.
     pub fn va_to_file(&self, va: u64) -> Option<usize> {
         for &(seg_va, seg_off, seg_size) in &self.segments {
-            if va >= seg_va && va < seg_va + seg_size {
-                return Some((seg_off + (va - seg_va)) as usize);
+            let seg_end = seg_va.checked_add(seg_size)?;
+            if va >= seg_va && va < seg_end {
+                let delta = va.checked_sub(seg_va)?;
+                let file = seg_off.checked_add(delta)?;
+                return usize::try_from(file).ok();
             }
         }
         None
@@ -271,8 +274,10 @@ impl<'a> BinaryContext<'a> {
     pub fn file_to_va(&self, file_off: usize) -> Option<u64> {
         let file_off = file_off as u64;
         for &(seg_va, seg_off, seg_size) in &self.segments {
-            if file_off >= seg_off && file_off < seg_off + seg_size {
-                return Some(seg_va + (file_off - seg_off));
+            let seg_end = seg_off.checked_add(seg_size)?;
+            if file_off >= seg_off && file_off < seg_end {
+                let delta = file_off.checked_sub(seg_off)?;
+                return seg_va.checked_add(delta);
             }
         }
         None
@@ -281,11 +286,7 @@ impl<'a> BinaryContext<'a> {
     /// Return the raw bytes for a given [`SectionRange`], bounds-checked.
     pub fn section_data(&self, range: &SectionRange) -> Option<&'a [u8]> {
         let end = range.offset.checked_add(range.size)?;
-        if end <= self.data.len() {
-            Some(&self.data[range.offset..end])
-        } else {
-            None
-        }
+        self.data.get(range.offset..end)
     }
 
     /// Iterate over ELF `PT_NOTE` segment byte slices.
@@ -294,9 +295,13 @@ impl<'a> BinaryContext<'a> {
     /// entries that can be walked with the standard `(namesz, descsz, type)`
     /// header format.
     pub fn elf_note_segments(&self) -> impl Iterator<Item = &'a [u8]> {
+        let data = self.data;
         self.elf_note_segments
             .iter()
-            .map(|&(offset, size)| &self.data[offset..offset + size])
+            .filter_map(move |&(offset, size)| {
+                let end = offset.checked_add(size)?;
+                data.get(offset..end)
+            })
     }
 }
 
@@ -315,10 +320,11 @@ impl<'a> BinaryContext<'a> {
 ///
 /// Source: `src/cmd/internal/buildid/buildid.go:246-251`
 pub fn detect_format(data: &[u8]) -> BinaryFormat {
-    if data.len() < 4 {
-        return BinaryFormat::Unknown;
-    }
-    match &data[..4] {
+    let head: &[u8; 4] = match data.get(..4).and_then(|s| s.try_into().ok()) {
+        Some(h) => h,
+        None => return BinaryFormat::Unknown,
+    };
+    match head {
         [0x7f, b'E', b'L', b'F'] => BinaryFormat::Elf,
         [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] => BinaryFormat::MachO,
         [0xfe, 0xed, 0xfa, 0xcf] | [0xfe, 0xed, 0xfa, 0xce] => BinaryFormat::MachO,
@@ -361,5 +367,8 @@ fn classify_section(name: &str, range: Option<SectionRange>, result: &mut GoSect
 fn check_elf_go_note(data: &[u8]) -> bool {
     const GO_NOTE_NAME: &[u8] = b"Go\x00\x00";
     let search_end = data.len().min(32768);
-    find_bytes(&data[..search_end], GO_NOTE_NAME).is_some()
+    match data.get(..search_end) {
+        Some(slice) => find_bytes(slice, GO_NOTE_NAME).is_some(),
+        None => false,
+    }
 }

@@ -92,7 +92,10 @@
 
 use crate::{
     formats::{BinaryContext, GoSections},
-    structures::{Arch, PclntabVersion},
+    structures::{
+        Arch, PclntabVersion,
+        util::{advance_n, read_uintptr, read_uvarint, slice_at},
+    },
 };
 
 /// All recognized pclntab magic values, in order from newest to oldest.
@@ -158,13 +161,10 @@ impl<'a> ParsedPclntab<'a> {
     /// Names are null-terminated UTF-8 strings. Returns `None` if the offset
     /// is out of bounds or the data is not valid UTF-8.
     pub fn func_name(&self, name_off: u32) -> Option<&'a str> {
-        let pos = self.funcname_offset + name_off as usize;
-        if pos >= self.data.len() {
-            return None;
-        }
-        let remaining = &self.data[pos..];
+        let pos = self.funcname_offset.checked_add(name_off as usize)?;
+        let remaining = self.data.get(pos..)?;
         let end = remaining.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&remaining[..end]).ok()
+        std::str::from_utf8(remaining.get(..end)?).ok()
     }
 
     /// Look up a source file path by its offset into `filetab`.
@@ -172,28 +172,10 @@ impl<'a> ParsedPclntab<'a> {
     /// Paths are null-terminated UTF-8 strings, typically absolute paths
     /// as seen by the compiler.
     pub fn file_name(&self, file_off: u32) -> Option<&'a str> {
-        let pos = self.filetab_offset + file_off as usize;
-        if pos >= self.data.len() {
-            return None;
-        }
-        let remaining = &self.data[pos..];
+        let pos = self.filetab_offset.checked_add(file_off as usize)?;
+        let remaining = self.data.get(pos..)?;
         let end = remaining.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&remaining[..end]).ok()
-    }
-
-    /// Read a pointer-sized little-endian integer at `offset` within the pclntab.
-    #[allow(dead_code)]
-    fn read_ptr(&self, offset: usize) -> Option<usize> {
-        let ps = self.ptr_size as usize;
-        if offset + ps > self.data.len() {
-            return None;
-        }
-        let bytes = &self.data[offset..offset + ps];
-        Some(match ps {
-            4 => u32::from_le_bytes(bytes.try_into().ok()?) as usize,
-            8 => u64::from_le_bytes(bytes.try_into().ok()?) as usize,
-            _ => return None,
-        })
+        std::str::from_utf8(remaining.get(..end)?).ok()
     }
 
     /// Iterate over `(entryoff, funcoff)` pairs from the functab.
@@ -218,27 +200,63 @@ impl<'a> ParsedPclntab<'a> {
     ///
     /// Source: `src/runtime/runtime2.go:1074-1099`
     pub fn parse_func(&self, func_off: u32) -> Option<FuncData> {
-        let off = self.functab_offset + func_off as usize;
-        if off + 44 > self.data.len() {
+        let off = self.functab_offset.checked_add(func_off as usize)?;
+        let d = self.data.get(off..)?;
+        if d.len() < 44 {
             return None;
         }
-        let d = &self.data[off..];
-
         Some(FuncData {
-            entry_off: u32::from_le_bytes(d[0..4].try_into().ok()?),
-            name_off: i32::from_le_bytes(d[4..8].try_into().ok()?),
-            args: i32::from_le_bytes(d[8..12].try_into().ok()?),
-            deferreturn: u32::from_le_bytes(d[12..16].try_into().ok()?),
-            pcsp: u32::from_le_bytes(d[16..20].try_into().ok()?),
-            pcfile: u32::from_le_bytes(d[20..24].try_into().ok()?),
-            pcln: u32::from_le_bytes(d[24..28].try_into().ok()?),
-            npcdata: u32::from_le_bytes(d[28..32].try_into().ok()?),
-            cu_offset: u32::from_le_bytes(d[32..36].try_into().ok()?),
-            start_line: i32::from_le_bytes(d[36..40].try_into().ok()?),
-            func_id: d[40],
-            flag: d[41],
-            nfuncdata: d[43],
+            func_off,
+            entry_off: u32::from_le_bytes(slice_at::<4>(d, 0)?),
+            name_off: i32::from_le_bytes(slice_at::<4>(d, 4)?),
+            args: i32::from_le_bytes(slice_at::<4>(d, 8)?),
+            deferreturn: u32::from_le_bytes(slice_at::<4>(d, 12)?),
+            pcsp: u32::from_le_bytes(slice_at::<4>(d, 16)?),
+            pcfile: u32::from_le_bytes(slice_at::<4>(d, 20)?),
+            pcln: u32::from_le_bytes(slice_at::<4>(d, 24)?),
+            npcdata: u32::from_le_bytes(slice_at::<4>(d, 28)?),
+            cu_offset: u32::from_le_bytes(slice_at::<4>(d, 32)?),
+            start_line: i32::from_le_bytes(slice_at::<4>(d, 36)?),
+            func_id: *d.get(40)?,
+            flag: *d.get(41)?,
+            nfuncdata: *d.get(43)?,
         })
+    }
+
+    /// Read the i-th `pcdata[]` table offset (raw `u32` into `pctab`) for the
+    /// given function.
+    ///
+    /// Returns `None` if `i >= func.npcdata` or the read goes out of bounds.
+    pub fn pcdata_at(&self, func: &FuncData, i: u32) -> Option<u32> {
+        if i >= func.npcdata {
+            return None;
+        }
+        let base = self
+            .functab_offset
+            .checked_add(func.func_off as usize)?
+            .checked_add(44)?;
+        let pos = base.checked_add((i as usize).checked_mul(4)?)?;
+        Some(u32::from_le_bytes(slice_at::<4>(self.data, pos)?))
+    }
+
+    /// Read the i-th `funcdata[]` offset for the given function. The value
+    /// is a `u32` offset into `moduledata.gofunc`; `0xFFFFFFFF` (`^uint32(0)`)
+    /// is the sentinel for "no funcdata at this index" — callers should treat
+    /// it as `None`.
+    ///
+    /// Returns `None` if `i >= func.nfuncdata` or the read goes out of bounds.
+    pub fn funcdata_at(&self, func: &FuncData, i: u8) -> Option<u32> {
+        if i >= func.nfuncdata {
+            return None;
+        }
+        let base = self
+            .functab_offset
+            .checked_add(func.func_off as usize)?
+            .checked_add(44)?;
+        let pcdata_bytes = (func.npcdata as usize).checked_mul(4)?;
+        let after_pcdata = base.checked_add(pcdata_bytes)?;
+        let pos = after_pcdata.checked_add((i as usize).checked_mul(4)?)?;
+        Some(u32::from_le_bytes(slice_at::<4>(self.data, pos)?))
     }
 
     /// Decode a PC-value table from the pctab.
@@ -254,66 +272,55 @@ impl<'a> ParsedPclntab<'a> {
     ///
     /// Source: `src/runtime/symtab.go:518-571` (`pcvalue`),
     /// `src/cmd/internal/obj/pcln.go:112-137` (encoder)
-    pub fn decode_pcvalue(&self, pctab_off: u32) -> Vec<(u32, i32)> {
-        let start = self.pctab_offset + pctab_off as usize;
-        if start >= self.data.len() {
-            return Vec::new();
+    pub fn decode_pcvalue(&self, pctab_off: u32) -> PcValueIter<'a> {
+        let start = self.pctab_offset.saturating_add(pctab_off as usize);
+        let data = self.data.get(start..).unwrap_or(&[]);
+        PcValueIter {
+            data,
+            pos: 0,
+            pc: 0,
+            val: -1,
+            min_lc: self.min_lc as u32,
+            done: data.is_empty(),
         }
-        let data = &self.data[start..];
-        let min_lc = self.min_lc as u32;
-        let mut result = Vec::new();
-        let mut pc: u32 = 0;
-        let mut val: i32 = -1;
-        let mut pos = 0;
-
-        while let Some((uvdelta, n1)) = read_uvarint(&data[pos..]) {
-            pos += n1;
-
-            // Zigzag decode: if bit 0 is set, negate
-            let vdelta = if uvdelta & 1 != 0 {
-                -((uvdelta >> 1) as i32) - 1
-            } else {
-                (uvdelta >> 1) as i32
-            };
-            val = val.wrapping_add(vdelta);
-
-            let (uvpcdelta, n2) = match read_uvarint(&data[pos..]) {
-                Some(v) => v,
-                None => break,
-            };
-            pos += n2;
-
-            if uvpcdelta == 0 {
-                break;
-            }
-            pc = pc.wrapping_add((uvpcdelta as u32).wrapping_mul(min_lc));
-            result.push((pc, val));
-        }
-
-        result
     }
 
-    /// Decode the PC-to-line table for a function, returning `(pc_offset, line_number)` pairs.
-    ///
-    /// Line numbers are absolute (start_line + accumulated deltas).
-    pub fn decode_pcln(&self, func: &FuncData) -> Vec<(u32, i32)> {
-        let mut entries = self.decode_pcvalue(func.pcln);
-        for entry in &mut entries {
-            entry.1 += func.start_line;
+    /// Streaming PC-to-line iterator. Line numbers are absolute
+    /// (`start_line + accumulated delta`).
+    pub fn decode_pcln(&self, func: &FuncData) -> PcLineIter<'a> {
+        PcLineIter {
+            inner: self.decode_pcvalue(func.pcln),
+            start_line: func.start_line,
         }
-        entries
+    }
+
+    /// Streaming PC-to-file iterator yielding `(pc_offset, file_index)`.
+    /// `file_index` is unsigned and suitable for passing to
+    /// [`Self::resolve_file_via_cu`] together with `func.cu_offset`.
+    pub fn decode_pcfile(&self, func: &FuncData) -> PcFileIter<'a> {
+        PcFileIter {
+            inner: self.decode_pcvalue(func.pcfile),
+        }
+    }
+
+    /// Streaming PC-to-file iterator that resolves each index to its source
+    /// file path via the cutab. Skips entries whose index does not resolve.
+    pub fn decode_pcfile_paths<'pcl>(&'pcl self, func: &FuncData) -> PcFilePathIter<'pcl, 'a> {
+        PcFilePathIter {
+            inner: self.decode_pcfile(func),
+            pcl: self,
+            cu_offset: func.cu_offset,
+        }
     }
 
     /// Resolve the source file for a function via its pcfile and cutab entries.
     ///
-    /// The pcfile table maps PC ranges to file indices. These indices are looked up
-    /// through the compilation unit table (`cutab`) to get offsets into `filetab`.
-    ///
-    /// Returns the file name for the first (entry-point) file index.
+    /// Returns the file name for the first (entry-point) file index. Wraps
+    /// [`Self::decode_pcfile`] + [`Self::resolve_file_via_cu`] for the common
+    /// "where does this function start in source?" use case.
     pub fn resolve_source_file(&self, func: &FuncData) -> Option<&'a str> {
-        let entries = self.decode_pcvalue(func.pcfile);
-        let file_idx = entries.first().map(|e| e.1)?;
-        self.resolve_file_via_cu(func.cu_offset, file_idx as u32)
+        let (_, idx) = self.decode_pcfile(func).next()?;
+        self.resolve_file_via_cu(func.cu_offset, idx)
     }
 
     /// Resolve a file index through the cutab to get a filetab offset, then
@@ -324,34 +331,37 @@ impl<'a> ParsedPclntab<'a> {
     /// offset into filetab.
     ///
     /// Source: `src/runtime/symtab.go:714-726` (`funcfile`)
-    fn resolve_file_via_cu(&self, cu_offset: u32, file_idx: u32) -> Option<&'a str> {
-        let cu_pos = self.cu_offset + (cu_offset as usize + file_idx as usize) * 4;
-        if cu_pos + 4 > self.data.len() {
-            return None;
-        }
-        let file_off = u32::from_le_bytes(self.data[cu_pos..cu_pos + 4].try_into().ok()?);
+    pub fn resolve_file_via_cu(&self, cu_offset: u32, file_idx: u32) -> Option<&'a str> {
+        let logical = (cu_offset as usize).checked_add(file_idx as usize)?;
+        let byte_offset = logical.checked_mul(4)?;
+        let cu_pos = self.cu_offset.checked_add(byte_offset)?;
+        let file_off = u32::from_le_bytes(slice_at::<4>(self.data, cu_pos)?);
         self.file_name(file_off)
     }
 
     /// Get the line number range for a function: `(start_line, end_line)`.
     ///
-    /// Decodes the pcln table and returns the min and max line numbers.
+    /// Streams the pcln table once to find the min and max line numbers.
     pub fn line_range(&self, func: &FuncData) -> Option<(i32, i32)> {
-        let entries = self.decode_pcln(func);
-        if entries.is_empty() {
-            return None;
+        let mut iter = self.decode_pcln(func);
+        let (_, first) = iter.next()?;
+        let (mut min, mut max) = (first, first);
+        for (_, line) in iter {
+            if line < min {
+                min = line;
+            }
+            if line > max {
+                max = line;
+            }
         }
-        let min = entries.iter().map(|e| e.1).min().unwrap();
-        let max = entries.iter().map(|e| e.1).max().unwrap();
         Some((min, max))
     }
 
     /// Get the maximum stack frame size for a function.
     ///
-    /// Decodes the pcsp table and returns the peak SP delta.
+    /// Streams the pcsp table once and returns the peak SP delta.
     pub fn max_frame_size(&self, func: &FuncData) -> Option<i32> {
-        let entries = self.decode_pcvalue(func.pcsp);
-        entries.iter().map(|e| e.1).max()
+        self.decode_pcvalue(func.pcsp).map(|(_, v)| v).max()
     }
 
     /// Iterate over all source file paths in the filetab.
@@ -359,12 +369,7 @@ impl<'a> ParsedPclntab<'a> {
     /// The filetab is a sequence of null-terminated strings. Yields each
     /// non-empty valid UTF-8 entry as a borrowed `&str`.
     pub fn file_names(&self) -> FileNameIter<'a> {
-        let start = self.filetab_offset;
-        let filetab_data = if start < self.data.len() {
-            &self.data[start..]
-        } else {
-            &[]
-        };
+        let filetab_data = self.data.get(self.filetab_offset..).unwrap_or(&[]);
         FileNameIter {
             data: filetab_data,
             pos: 0,
@@ -388,18 +393,19 @@ impl Iterator for FuncEntryIter<'_> {
         if self.index >= self.count {
             return None;
         }
-        let off = self.base + self.index * 8;
-        if off + 8 > self.data.len() {
-            return None;
-        }
-        let entry_off = u32::from_le_bytes(self.data[off..off + 4].try_into().ok()?);
-        let func_off = u32::from_le_bytes(self.data[off + 4..off + 8].try_into().ok()?);
-        self.index += 1;
+        let off = self
+            .index
+            .checked_mul(8)
+            .and_then(|d| self.base.checked_add(d))?;
+        let entry_off = u32::from_le_bytes(slice_at::<4>(self.data, off)?);
+        let func_off_pos = off.checked_add(4)?;
+        let func_off = u32::from_le_bytes(slice_at::<4>(self.data, func_off_pos)?);
+        self.index = self.index.checked_add(1)?;
         Some((entry_off, func_off))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.count - self.index;
+        let remaining = self.count.saturating_sub(self.index);
         (remaining, Some(remaining))
     }
 }
@@ -418,17 +424,147 @@ impl<'a> Iterator for FileNameIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining > 0 && self.pos < self.data.len() {
-            let rest = &self.data[self.pos..];
+            let rest = self.data.get(self.pos..)?;
             let end = rest.iter().position(|&b| b == 0)?;
-            self.remaining -= 1;
-            self.pos += end + 1;
+            self.remaining = self.remaining.checked_sub(1)?;
+            self.pos = self.pos.checked_add(end)?.checked_add(1)?;
             if end > 0 {
-                if let Ok(name) = std::str::from_utf8(&rest[..end]) {
-                    return Some(name);
+                if let Some(name_bytes) = rest.get(..end) {
+                    if let Ok(name) = std::str::from_utf8(name_bytes) {
+                        return Some(name);
+                    }
                 }
             }
         }
         None
+    }
+}
+
+/// Streaming iterator over a delta-encoded PC-value table.
+///
+/// Each [`Iterator::next`] decodes one `(value_delta, pc_delta)` varint pair
+/// and yields the accumulated `(pc_offset, value)`. Stops at end-of-data,
+/// `pc_delta == 0` (table terminator), or any malformed varint. Wrapping
+/// arithmetic matches Go's runtime behaviour.
+///
+/// Source: `src/runtime/symtab.go:518-571` (`pcvalue`),
+/// `src/cmd/internal/obj/pcln.go:112-137` (encoder).
+pub struct PcValueIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    pc: u32,
+    val: i32,
+    min_lc: u32,
+    done: bool,
+}
+
+impl Iterator for PcValueIter<'_> {
+    type Item = (u32, i32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let (uvdelta, n1) = match self.data.get(self.pos..).and_then(read_uvarint) {
+            Some(v) => v,
+            None => {
+                self.done = true;
+                return None;
+            }
+        };
+        self.pos = match self.pos.checked_add(n1) {
+            Some(p) => p,
+            None => {
+                self.done = true;
+                return None;
+            }
+        };
+
+        // Zigzag decode: bit 0 = sign, remaining bits = magnitude. Wrapping
+        // arithmetic matches Go's runtime decoder which permits signed wrap.
+        let half = (uvdelta >> 1) as i32;
+        let vdelta = if uvdelta & 1 != 0 {
+            half.wrapping_neg().wrapping_sub(1)
+        } else {
+            half
+        };
+        self.val = self.val.wrapping_add(vdelta);
+
+        let (uvpcdelta, n2) = match self.data.get(self.pos..).and_then(read_uvarint) {
+            Some(v) => v,
+            None => {
+                self.done = true;
+                return None;
+            }
+        };
+        self.pos = match self.pos.checked_add(n2) {
+            Some(p) => p,
+            None => {
+                self.done = true;
+                return None;
+            }
+        };
+
+        if uvpcdelta == 0 {
+            self.done = true;
+            return None;
+        }
+        self.pc = self
+            .pc
+            .wrapping_add((uvpcdelta as u32).wrapping_mul(self.min_lc));
+        Some((self.pc, self.val))
+    }
+}
+
+/// Streaming PC-to-line iterator. Wraps [`PcValueIter`] and adds the
+/// function's `start_line` to each accumulated value.
+pub struct PcLineIter<'a> {
+    inner: PcValueIter<'a>,
+    start_line: i32,
+}
+
+impl Iterator for PcLineIter<'_> {
+    type Item = (u32, i32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (pc, v) = self.inner.next()?;
+        Some((pc, v.wrapping_add(self.start_line)))
+    }
+}
+
+/// Streaming PC-to-file-index iterator. Re-types the value to `u32` since
+/// file indices are non-negative.
+pub struct PcFileIter<'a> {
+    inner: PcValueIter<'a>,
+}
+
+impl Iterator for PcFileIter<'_> {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (pc, v) = self.inner.next()?;
+        Some((pc, v as u32))
+    }
+}
+
+/// Streaming PC-to-file-path iterator. Resolves each file index through the
+/// pclntab's cutab; entries that fail to resolve are skipped silently.
+pub struct PcFilePathIter<'pcl, 'a> {
+    inner: PcFileIter<'a>,
+    pcl: &'pcl ParsedPclntab<'a>,
+    cu_offset: u32,
+}
+
+impl<'a> Iterator for PcFilePathIter<'_, 'a> {
+    type Item = (u32, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (pc, idx) = self.inner.next()?;
+            if let Some(path) = self.pcl.resolve_file_via_cu(self.cu_offset, idx) {
+                return Some((pc, path));
+            }
+        }
     }
 }
 
@@ -457,7 +593,20 @@ impl<'a> Iterator for FileNameIter<'a> {
 /// | 100   | `FuncIDWrapper`         | Auto-generated wrapper         |
 #[derive(Debug)]
 pub struct FuncData {
+    /// Offset of this `_func` struct within the functab section. Required to
+    /// locate the variable-length `pcdata[]` and `funcdata[]` arrays that
+    /// follow the 44-byte fixed prefix.
+    pub func_off: u32,
     /// PC offset from `moduledata.text` (the start of executable code).
+    ///
+    /// This is **not** a `goblin`-derived RVA. To translate to a binary-level
+    /// VA or RVA, add the runtime address of `runtime.text` (exposed via
+    /// [`crate::GoBinary::text_va`]):
+    ///
+    /// ```text
+    /// va  = bin.text_va()? + func.entry_off as u64
+    /// rva = va - image_base   // for image-base-relative formats (PE)
+    /// ```
     pub entry_off: u32,
     /// Index into `funcnametab` for this function's name.
     pub name_off: i32,
@@ -510,10 +659,13 @@ pub fn parse<'a>(ctx: &BinaryContext<'a>) -> Option<ParsedPclntab<'a>> {
 
     // Strategy 0: known section + magic validation (cheapest)
     if let Some(ref range) = sections.gopclntab {
-        let end = (range.offset + range.size).min(data.len());
-        let section_data = &data[range.offset..end];
-        if let Some(parsed) = try_parse_at(section_data, range.offset) {
-            return Some(parsed);
+        if let Some(raw_end) = range.offset.checked_add(range.size) {
+            let end = raw_end.min(data.len());
+            if let Some(section_data) = data.get(range.offset..end) {
+                if let Some(parsed) = try_parse_at(section_data, range.offset) {
+                    return Some(parsed);
+                }
+            }
         }
     }
 
@@ -543,7 +695,7 @@ fn try_parse_at(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
         return None;
     }
 
-    let magic_bytes: [u8; 4] = data[..4].try_into().ok()?;
+    let magic_bytes = slice_at::<4>(data, 0)?;
     let version = MAGICS
         .iter()
         .find(|(m, _)| *m == magic_bytes)
@@ -555,10 +707,15 @@ fn try_parse_at(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
 /// Scan the binary for pclntab magic bytes at 4-byte aligned offsets.
 fn scan_for_magic(data: &[u8]) -> Option<ParsedPclntab<'_>> {
     for offset in (0..data.len().saturating_sub(72)).step_by(4) {
-        let magic: [u8; 4] = data[offset..offset + 4].try_into().ok()?;
+        let magic = match slice_at::<4>(data, offset) {
+            Some(m) => m,
+            None => continue,
+        };
         if MAGICS.iter().any(|(m, _)| *m == magic) {
-            if let Some(parsed) = try_parse_at(&data[offset..], offset) {
-                return Some(parsed);
+            if let Some(rest) = data.get(offset..) {
+                if let Some(parsed) = try_parse_at(rest, offset) {
+                    return Some(parsed);
+                }
             }
         }
     }
@@ -578,7 +735,7 @@ fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
     }
 
     // Try magic first to get a definite version
-    let magic_bytes: [u8; 4] = data[..4].try_into().ok()?;
+    let magic_bytes = slice_at::<4>(data, 0)?;
     let version = MAGICS
         .iter()
         .find(|(m, _)| *m == magic_bytes)
@@ -586,12 +743,12 @@ fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
         .unwrap_or(PclntabVersion::Go120); // assume newest if magic is wiped
 
     // Validate pad bytes (must be zero)
-    if data[4] != 0 || data[5] != 0 {
+    if *data.get(4)? != 0 || *data.get(5)? != 0 {
         return None;
     }
 
-    let min_lc = data[6];
-    let ptr_size = data[7];
+    let min_lc = *data.get(6)?;
+    let ptr_size = *data.get(7)?;
     if !matches!(min_lc, 1 | 2 | 4) || !matches!(ptr_size, 4 | 8) {
         return None;
     }
@@ -611,19 +768,19 @@ fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
 
     // Spot-check: the first byte of funcnametab should be a null byte (the empty
     // name at index 0), followed by plausible ASCII function name characters.
-    if parsed.funcname_offset < data.len() {
-        let fndata = &data[parsed.funcname_offset..];
+    if let Some(fndata) = data.get(parsed.funcname_offset..) {
         // funcnametab[0] is always '\0' (the zero-index name is empty)
         if fndata.first() != Some(&0) {
             return None;
         }
         // Check that some bytes after the first null look like ASCII text
-        if fndata.len() > 2
-            && !fndata[1..fndata.len().min(32)]
-                .iter()
-                .any(|&b| b.is_ascii_alphanumeric())
-        {
-            return None;
+        if fndata.len() > 2 {
+            let scan_end = fndata.len().min(32);
+            if let Some(window) = fndata.get(1..scan_end) {
+                if !window.iter().any(|&b| b.is_ascii_alphanumeric()) {
+                    return None;
+                }
+            }
         }
     }
 
@@ -634,22 +791,27 @@ fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
 fn scan_relaxed<'a>(data: &'a [u8], sections: &GoSections) -> Option<ParsedPclntab<'a>> {
     // If we have the section bounds, only scan within them
     if let Some(ref range) = sections.gopclntab {
-        let end = (range.offset + range.size).min(data.len());
-        let section_data = &data[range.offset..end];
+        let raw_end = range.offset.checked_add(range.size)?;
+        let end = raw_end.min(data.len());
+        let section_data = data.get(range.offset..end)?;
         return try_parse_relaxed(section_data, range.offset);
     }
 
     // Otherwise scan the whole binary at pointer-aligned offsets.
     // This is more expensive, so step by 8 (common ptrSize alignment).
     for offset in (0..data.len().saturating_sub(72)).step_by(8) {
-        if let Some(parsed) = try_parse_relaxed(&data[offset..], offset) {
-            return Some(parsed);
+        if let Some(rest) = data.get(offset..) {
+            if let Some(parsed) = try_parse_relaxed(rest, offset) {
+                return Some(parsed);
+            }
         }
     }
     // Retry at 4-byte alignment for 32-bit binaries
     for offset in (4..data.len().saturating_sub(40)).step_by(8) {
-        if let Some(parsed) = try_parse_relaxed(&data[offset..], offset) {
-            return Some(parsed);
+        if let Some(rest) = data.get(offset..) {
+            if let Some(parsed) = try_parse_relaxed(rest, offset) {
+                return Some(parsed);
+            }
         }
     }
     None
@@ -678,27 +840,41 @@ fn scan_via_moduledata<'a>(ctx: &BinaryContext<'a>) -> Option<ParsedPclntab<'a>>
 
         // Scan the entire binary at pointer-aligned offsets looking for values
         // that point into the gopclntab section VA range.
-        let pclntab_va_end = pclntab_va + pclntab_range.size as u64;
+        let pclntab_va_end = pclntab_va.checked_add(pclntab_range.size as u64)?;
+        let header_window_end = pclntab_va.checked_add(64)?;
 
         for offset in (0..data.len().saturating_sub(ps)).step_by(ps) {
             let candidate_va = match ps {
-                4 => u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as u64,
-                8 => u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?),
+                4 => match slice_at::<4>(data, offset) {
+                    Some(b) => u32::from_le_bytes(b) as u64,
+                    None => continue,
+                },
+                8 => match slice_at::<8>(data, offset) {
+                    Some(b) => u64::from_le_bytes(b),
+                    None => continue,
+                },
                 _ => continue,
             };
 
             // Must point to the start of the gopclntab section (pcHeader is at the beginning)
             // Allow a small tolerance — the pointer should be within the first 64 bytes
             if candidate_va >= pclntab_va
-                && candidate_va < pclntab_va + 64
+                && candidate_va < header_window_end
                 && candidate_va < pclntab_va_end
             {
-                let target_file_off = ctx.va_to_file(candidate_va)?;
-                if target_file_off + 72 <= data.len() {
-                    if let Some(parsed) =
-                        try_parse_relaxed(&data[target_file_off..], target_file_off)
-                    {
-                        return Some(parsed);
+                let target_file_off = match ctx.va_to_file(candidate_va) {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let header_end = match target_file_off.checked_add(72) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if header_end <= data.len() {
+                    if let Some(rest) = data.get(target_file_off..) {
+                        if let Some(parsed) = try_parse_relaxed(rest, target_file_off) {
+                            return Some(parsed);
+                        }
                     }
                 }
             }
@@ -720,14 +896,23 @@ const FUNCTAB_MIN_RUN: usize = 100;
 /// Source: `src/runtime/symtab.go:635-653`
 fn scan_via_functab<'a>(data: &'a [u8]) -> Option<ParsedPclntab<'a>> {
     // We need at least FUNCTAB_MIN_RUN * 8 bytes for the functab + 72 for the header
-    if data.len() < FUNCTAB_MIN_RUN * 8 + 72 {
+    let min_required = FUNCTAB_MIN_RUN.checked_mul(8)?.checked_add(72)?;
+    if data.len() < min_required {
         return None;
     }
 
     // Scan at 4-byte aligned offsets for runs of monotonically increasing u32 pairs
-    let mut offset = 0;
-    while offset + FUNCTAB_MIN_RUN * 8 <= data.len() {
-        let run_len = count_monotonic_run(&data[offset..]);
+    let mut offset: usize = 0;
+    let run_bytes = FUNCTAB_MIN_RUN.checked_mul(8)?;
+    while let Some(end) = offset.checked_add(run_bytes) {
+        if end > data.len() {
+            break;
+        }
+        let window = match data.get(offset..) {
+            Some(w) => w,
+            None => break,
+        };
+        let run_len = count_monotonic_run(window);
         if run_len >= FUNCTAB_MIN_RUN {
             // We found a candidate functab at `offset` with `run_len` entries.
             // Try to locate the pcHeader by scanning backwards.
@@ -735,10 +920,11 @@ fn scan_via_functab<'a>(data: &'a [u8]) -> Option<ParsedPclntab<'a>> {
                 return Some(parsed);
             }
             // Skip past this run
-            offset += run_len * 8;
+            let skip = run_len.checked_mul(8)?;
+            offset = offset.checked_add(skip)?;
         } else {
             // Advance by 8 bytes (one functab entry) to find the next candidate
-            offset += 8;
+            offset = offset.checked_add(8)?;
         }
     }
     None
@@ -748,20 +934,26 @@ fn scan_via_functab<'a>(data: &'a [u8]) -> Option<ParsedPclntab<'a>> {
 ///
 /// Returns the number of pairs where `pair[i].entryoff < pair[i+1].entryoff`.
 fn count_monotonic_run(data: &[u8]) -> usize {
-    let mut count = 0;
+    let mut count: usize = 0;
     let mut prev_entry: u32 = 0;
-    let mut i = 0;
+    let mut i: usize = 0;
 
-    while i + 8 <= data.len() {
-        let entry_off = u32::from_le_bytes(match data[i..i + 4].try_into() {
-            Ok(b) => b,
-            Err(_) => break,
-        });
+    while let Some(end) = i.checked_add(8) {
+        if end > data.len() {
+            break;
+        }
+        let entry_off = match slice_at::<4>(data, i) {
+            Some(b) => u32::from_le_bytes(b),
+            None => break,
+        };
         // First entry: just record it
         if count == 0 {
             prev_entry = entry_off;
             count = 1;
-            i += 8;
+            i = match i.checked_add(8) {
+                Some(v) => v,
+                None => break,
+            };
             continue;
         }
         // Must be strictly increasing
@@ -769,8 +961,14 @@ fn count_monotonic_run(data: &[u8]) -> usize {
             break;
         }
         prev_entry = entry_off;
-        count += 1;
-        i += 8;
+        count = match count.checked_add(1) {
+            Some(v) => v,
+            None => break,
+        };
+        i = match i.checked_add(8) {
+            Some(v) => v,
+            None => break,
+        };
     }
     count
 }
@@ -793,84 +991,91 @@ fn recover_header_from_functab<'a>(
 
     let mut dist: usize = 4;
     while dist <= max_distance {
-        let candidate = functab_file_offset - dist;
+        let candidate = match functab_file_offset.checked_sub(dist) {
+            Some(c) => c,
+            None => break,
+        };
 
-        let hdr = &data[candidate..];
+        let hdr = match data.get(candidate..) {
+            Some(h) => h,
+            None => break,
+        };
+        if hdr.len() < 8 {
+            dist = match dist.checked_add(4) {
+                Some(d) => d,
+                None => break,
+            };
+            continue;
+        }
 
         // Quick structural check: pad1==0, pad2==0, minLC valid, ptrSize valid
-        if hdr[4] != 0 || hdr[5] != 0 {
-            dist += 4;
+        let pad1 = match hdr.get(4) {
+            Some(b) => *b,
+            None => break,
+        };
+        let pad2 = match hdr.get(5) {
+            Some(b) => *b,
+            None => break,
+        };
+        let min_lc = match hdr.get(6) {
+            Some(b) => *b,
+            None => break,
+        };
+        let ptr_size = match hdr.get(7) {
+            Some(b) => *b,
+            None => break,
+        };
+        if pad1 != 0 || pad2 != 0 {
+            dist = dist.checked_add(4)?;
             continue;
         }
-        if !matches!(hdr[6], 1 | 2 | 4) || !matches!(hdr[7], 4 | 8) {
-            dist += 4;
+        if !matches!(min_lc, 1 | 2 | 4) || !matches!(ptr_size, 4 | 8) {
+            dist = dist.checked_add(4)?;
             continue;
         }
 
-        let ps = hdr[7] as usize;
-        let header_size = 8 + 8 * ps;
-        if candidate + header_size > data.len() {
-            dist += 4;
+        let ps = ptr_size as usize;
+        let header_size = ps.checked_mul(8).and_then(|x| x.checked_add(8))?;
+        let header_end = candidate.checked_add(header_size)?;
+        if header_end > data.len() {
+            dist = dist.checked_add(4)?;
             continue;
         }
 
         // Read the pclnOffset (functab offset) from the header
-        let pclnoffset_pos = 8 + 7 * ps;
-        if candidate + pclnoffset_pos + ps > data.len() {
-            dist += 4;
+        let pclnoffset_pos = ps.checked_mul(7).and_then(|x| x.checked_add(8))?;
+        let read_end = candidate
+            .checked_add(pclnoffset_pos)
+            .and_then(|x| x.checked_add(ps))?;
+        if read_end > data.len() {
+            dist = dist.checked_add(4)?;
             continue;
         }
-        let pln_offset = read_uint(data, candidate + pclnoffset_pos, ps)?;
+        let read_pos = candidate.checked_add(pclnoffset_pos)?;
+        let pln_offset = usize::try_from(read_uintptr(data, read_pos, ptr_size)?).ok()?;
 
         // Check if this header's pclnOffset actually points to our functab
         if pln_offset == dist {
-            let nfunc = read_uint(data, candidate + 8, ps)?;
+            let nfunc_pos = candidate.checked_add(8)?;
+            let nfunc = usize::try_from(read_uintptr(data, nfunc_pos, ptr_size)?).ok()?;
 
             // nfunc should be close to run_len (run_len may include the +1 sentinel)
-            if nfunc > 0 && (nfunc == run_len || nfunc + 1 == run_len || nfunc == run_len + 1) {
-                if let Some(parsed) = try_parse_relaxed(&data[candidate..], candidate) {
-                    return Some(parsed);
+            let nfunc_plus_one = nfunc.checked_add(1);
+            let run_plus_one = run_len.checked_add(1);
+            if nfunc > 0
+                && (nfunc == run_len
+                    || nfunc_plus_one == Some(run_len)
+                    || Some(nfunc) == run_plus_one)
+            {
+                if let Some(rest) = data.get(candidate..) {
+                    if let Some(parsed) = try_parse_relaxed(rest, candidate) {
+                        return Some(parsed);
+                    }
                 }
             }
         }
 
-        dist += 4;
-    }
-    None
-}
-
-/// Read a little-endian unsigned integer of `size` bytes (4 or 8) from `data` at `offset`.
-fn read_uint(data: &[u8], offset: usize, size: usize) -> Option<usize> {
-    if offset + size > data.len() {
-        return None;
-    }
-    Some(match size {
-        4 => u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize,
-        8 => u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize,
-        _ => return None,
-    })
-}
-
-/// Decode an unsigned LEB128 / base-128 varint from a byte slice.
-///
-/// Returns `(value, bytes_consumed)`. Each byte contributes 7 data bits (low 7)
-/// and 1 continuation bit (high bit). Maximum 10 bytes (for u64).
-///
-/// This is the same encoding used by Go's `binary.Uvarint` and the pctab encoder.
-///
-/// Source: `src/encoding/binary/varint.go:63-82`
-fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        if i >= 10 {
-            return None;
-        }
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, i + 1));
-        }
-        shift += 7;
+        dist = dist.checked_add(4)?;
     }
     None
 }
@@ -885,38 +1090,37 @@ fn parse_header(
     version: PclntabVersion,
 ) -> Option<ParsedPclntab<'_>> {
     // Validate padding bytes (must be zero)
-    if data[4] != 0 || data[5] != 0 {
+    if *data.get(4)? != 0 || *data.get(5)? != 0 {
         return None;
     }
 
-    let min_lc = data[6];
-    let ptr_size = data[7];
+    let min_lc = *data.get(6)?;
+    let ptr_size = *data.get(7)?;
     if !matches!(min_lc, 1 | 2 | 4) || !matches!(ptr_size, 4 | 8) {
         return None;
     }
 
     let ps = ptr_size as usize;
-    let header_size = 8 + 8 * ps;
+    let header_size = advance_n(8, 8, ps)?;
     if data.len() < header_size {
         return None;
     }
 
-    let read_ptr = |offset: usize| -> Option<usize> {
-        let bytes = &data[offset..offset + ps];
-        Some(match ps {
-            4 => u32::from_le_bytes(bytes.try_into().ok()?) as usize,
-            8 => u64::from_le_bytes(bytes.try_into().ok()?) as usize,
-            _ => return None,
-        })
+    // Read a pointer-sized field at the i-th slot after the 8-byte header
+    // prefix (`field_off(i) = 8 + i*ps`). Wraps `read_uintptr` and narrows
+    // to `usize`, returning `None` on overflow.
+    let read_field = |idx: usize| -> Option<usize> {
+        let off = advance_n(8, idx, ps)?;
+        usize::try_from(read_uintptr(data, off, ptr_size)?).ok()
     };
 
-    let nfunc = read_ptr(8)?;
-    let nfiles = read_ptr(8 + ps)?;
-    let funcname_offset = read_ptr(8 + 3 * ps)?;
-    let cu_offset = read_ptr(8 + 4 * ps)?;
-    let filetab_offset = read_ptr(8 + 5 * ps)?;
-    let pctab_offset = read_ptr(8 + 6 * ps)?;
-    let functab_offset = read_ptr(8 + 7 * ps)?;
+    let nfunc = read_field(0)?;
+    let nfiles = read_field(1)?;
+    let funcname_offset = read_field(3)?;
+    let cu_offset = read_field(4)?;
+    let filetab_offset = read_field(5)?;
+    let pctab_offset = read_field(6)?;
+    let functab_offset = read_field(7)?;
 
     // Sanity: reject obviously bogus values
     if nfunc > 10_000_000 || nfiles > 10_000_000 {

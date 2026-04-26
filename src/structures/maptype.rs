@@ -60,9 +60,9 @@ impl MapTypeExtra {
     /// - ps=4: 10*4 + 4 = 44 bytes (no padding needed)
     /// - ps=8: 10*8 + 4 + 4 = 88 bytes (4 bytes padding for alignment)
     pub fn size(ps: u8) -> usize {
-        let base = 10 * ps as usize + 4;
+        let base = (ps as usize).saturating_mul(10).saturating_add(4);
         if ps == 8 {
-            base + 4 // alignment padding
+            base.saturating_add(4) // alignment padding
         } else {
             base
         }
@@ -77,28 +77,28 @@ impl MapTypeExtra {
             return None;
         }
 
-        let mut off = 0;
+        let mut off: usize = 0;
 
         let key = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let elem = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let group = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let hasher = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let group_size = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let keys_off = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let key_stride = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let elems_off = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let elem_stride = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let elem_off = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
         let flags = read_u32(data, off)?;
 
         Some(Self {

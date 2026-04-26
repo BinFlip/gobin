@@ -26,7 +26,7 @@ pub struct ChanTypeExtra {
 impl ChanTypeExtra {
     /// Binary size: 2 * pointer_size.
     pub fn size(ps: u8) -> usize {
-        2 * ps as usize
+        (ps as usize).saturating_mul(2)
     }
 
     /// Parse from `data`. Data must start at the chan type extra fields.

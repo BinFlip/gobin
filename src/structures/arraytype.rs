@@ -29,7 +29,7 @@ pub struct ArrayTypeExtra {
 impl ArrayTypeExtra {
     /// Binary size: 3 * pointer_size.
     pub fn size(ps: u8) -> usize {
-        3 * ps as usize
+        (ps as usize).saturating_mul(3)
     }
 
     /// Parse from `data`. Data must start at the array type extra fields.
@@ -44,7 +44,7 @@ impl ArrayTypeExtra {
         Some(Self {
             elem: read_uintptr(data, 0, ps)?,
             slice: read_uintptr(data, p, ps)?,
-            len: read_uintptr(data, 2 * p, ps)?,
+            len: read_uintptr(data, p.saturating_mul(2), ps)?,
         })
     }
 }

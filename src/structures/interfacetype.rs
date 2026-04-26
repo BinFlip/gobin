@@ -26,7 +26,7 @@ pub struct InterfaceTypeExtra {
 impl InterfaceTypeExtra {
     /// Binary size: pointer_size + GoSlice::size(ps).
     pub fn size(ps: u8) -> usize {
-        ps as usize + GoSlice::size(ps)
+        (ps as usize).saturating_add(GoSlice::size(ps))
     }
 
     /// Parse from `data`. Data must start at the interface type extra fields.

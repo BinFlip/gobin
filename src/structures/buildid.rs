@@ -43,6 +43,7 @@
 use crate::{
     detection::find_bytes,
     formats::{BinaryContext, BinaryFormat},
+    structures::util::{align_up, slice_at},
 };
 
 /// Raw build ID prefix in non-ELF binaries.
@@ -80,7 +81,7 @@ const RAW_SEARCH_LIMIT: usize = 65536;
 /// For ELF binaries, first tries the structured `PT_NOTE` path (faster, more
 /// reliable), then falls back to raw marker scanning.
 /// For Mach-O and PE, uses raw marker scanning only.
-pub fn extract(ctx: &BinaryContext<'_>) -> Option<String> {
+pub fn extract<'a>(ctx: &BinaryContext<'a>) -> Option<&'a str> {
     match ctx.format() {
         BinaryFormat::Elf => extract_elf_note(ctx).or_else(|| extract_raw_marker(ctx.data())),
         _ => extract_raw_marker(ctx.data()),
@@ -92,16 +93,20 @@ pub fn extract(ctx: &BinaryContext<'_>) -> Option<String> {
 /// The build ID string between the quotes is extracted verbatim. It may contain
 /// Go string escape sequences (the Go toolchain uses `strconv.Quote`), but in
 /// practice build IDs are pure ASCII base64 characters.
-fn extract_raw_marker(data: &[u8]) -> Option<String> {
+fn extract_raw_marker(data: &[u8]) -> Option<&str> {
     let search_end = data.len().min(RAW_SEARCH_LIMIT);
-    let prefix_pos = find_bytes(&data[..search_end], BUILD_ID_PREFIX)?;
-    let id_start = prefix_pos + BUILD_ID_PREFIX.len();
+    let head = data.get(..search_end)?;
+    let prefix_pos = find_bytes(head, BUILD_ID_PREFIX)?;
+    let id_start = prefix_pos.checked_add(BUILD_ID_PREFIX.len())?;
 
     // Look for the suffix within 1KB of the prefix (build IDs are ~83 chars)
-    let search_window = &data[id_start..data.len().min(id_start + 1024)];
+    let window_end = id_start.checked_add(1024)?.min(data.len());
+    let search_window = data.get(id_start..window_end)?;
     let suffix_pos = find_bytes(search_window, BUILD_ID_SUFFIX)?;
 
-    String::from_utf8(data[id_start..id_start + suffix_pos].to_vec()).ok()
+    let id_end = id_start.checked_add(suffix_pos)?;
+    let bytes = data.get(id_start..id_end)?;
+    std::str::from_utf8(bytes).ok()
 }
 
 /// Extract build ID from ELF `PT_NOTE` segments.
@@ -119,7 +124,7 @@ fn extract_raw_marker(data: &[u8]) -> Option<String> {
 /// 12      N     name    (null-padded to 4-byte alignment)
 /// 12+N    M     desc    (null-padded to 4-byte alignment)
 /// ```
-fn extract_elf_note(ctx: &BinaryContext<'_>) -> Option<String> {
+fn extract_elf_note<'a>(ctx: &BinaryContext<'a>) -> Option<&'a str> {
     for note_data in ctx.elf_note_segments() {
         if let Some(id) = parse_go_note(note_data) {
             return Some(id);
@@ -129,37 +134,39 @@ fn extract_elf_note(ctx: &BinaryContext<'_>) -> Option<String> {
 }
 
 /// Walk an ELF note segment looking for the Go build ID note.
-fn parse_go_note(data: &[u8]) -> Option<String> {
-    let mut pos = 0;
-    while pos + 12 <= data.len() {
-        let namesz = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        let descsz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
-        let note_type = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().ok()?);
+fn parse_go_note(data: &[u8]) -> Option<&str> {
+    let mut pos: usize = 0;
+    loop {
+        let header_end = pos.checked_add(12)?;
+        if header_end > data.len() {
+            return None;
+        }
+        let namesz = u32::from_le_bytes(slice_at::<4>(data, pos)?) as usize;
+        let descsz_off = pos.checked_add(4)?;
+        let descsz = u32::from_le_bytes(slice_at::<4>(data, descsz_off)?) as usize;
+        let type_off = pos.checked_add(8)?;
+        let note_type = u32::from_le_bytes(slice_at::<4>(data, type_off)?);
 
-        let name_start = pos + 12;
-        let name_padded = align4(namesz);
-        let desc_start = name_start + name_padded;
-        let desc_padded = align4(descsz);
+        let name_start = header_end;
+        let name_padded = align_up(namesz, 4)?;
+        let desc_start = name_start.checked_add(name_padded)?;
+        let desc_padded = align_up(descsz, 4)?;
 
-        if desc_start + descsz > data.len() {
-            break;
+        let desc_end = desc_start.checked_add(descsz)?;
+        if desc_end > data.len() {
+            return None;
         }
 
         if namesz == 4
             && note_type == ELF_NOTE_GOBUILDID_TAG
-            && &data[name_start..name_start + 4] == ELF_GO_NOTE_NAME
+            && data.get(name_start..name_start.checked_add(4)?) == Some(ELF_GO_NOTE_NAME)
         {
-            return String::from_utf8(data[desc_start..desc_start + descsz].to_vec()).ok();
+            let bytes = data.get(desc_start..desc_end)?;
+            return std::str::from_utf8(bytes).ok();
         }
 
-        pos = desc_start + desc_padded;
+        pos = desc_start.checked_add(desc_padded)?;
     }
-    None
-}
-
-/// Round `n` up to the nearest multiple of 4 (ELF note alignment).
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
 }
 
 #[cfg(test)]

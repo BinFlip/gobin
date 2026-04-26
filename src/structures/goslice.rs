@@ -21,7 +21,7 @@ pub struct GoSlice {
 impl GoSlice {
     /// Binary size: 3 * pointer_size.
     pub fn size(ps: u8) -> usize {
-        3 * ps as usize
+        (ps as usize).saturating_mul(3)
     }
 
     /// Parse from raw bytes at the given offset.
@@ -29,8 +29,8 @@ impl GoSlice {
         let p = ps as usize;
         Some(Self {
             ptr: read_uintptr(data, offset, ps)?,
-            len: read_uintptr(data, offset + p, ps)?,
-            cap: read_uintptr(data, offset + 2 * p, ps)?,
+            len: read_uintptr(data, offset.checked_add(p)?, ps)?,
+            cap: read_uintptr(data, offset.checked_add(p.saturating_mul(2))?, ps)?,
         })
     }
 }

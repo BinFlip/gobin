@@ -62,7 +62,7 @@ impl AbiType {
     ///
     /// Layout: 4 * ps + 16 bytes.
     pub fn size(ps: u8) -> usize {
-        4 * ps as usize + 16
+        (ps as usize).saturating_mul(4).saturating_add(16)
     }
 
     /// Parse an `abi.Type` from `data`. Data must start at the type.
@@ -75,28 +75,28 @@ impl AbiType {
             return None;
         }
 
-        let mut off = 0;
+        let mut off: usize = 0;
 
         let size_ = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
 
         let ptr_bytes = read_uintptr(data, off, ps)?;
-        off += p;
+        off = off.checked_add(p)?;
 
         let hash = read_u32(data, off)?;
-        off += 4;
+        off = off.checked_add(4)?;
 
         let tflag = *data.get(off)?;
-        let align_ = *data.get(off + 1)?;
-        let field_align_ = *data.get(off + 2)?;
-        let kind_ = *data.get(off + 3)?;
-        off += 4;
+        let align_ = *data.get(off.checked_add(1)?)?;
+        let field_align_ = *data.get(off.checked_add(2)?)?;
+        let kind_ = *data.get(off.checked_add(3)?)?;
+        off = off.checked_add(4)?;
 
         // Skip Equal (uintptr) and GCData (uintptr)
-        off += 2 * p;
+        off = off.checked_add(p.saturating_mul(2))?;
 
         let str_off = read_i32(data, off)?;
-        off += 4;
+        off = off.checked_add(4)?;
 
         let ptr_to_this = read_i32(data, off)?;
 

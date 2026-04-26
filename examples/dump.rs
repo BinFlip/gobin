@@ -1,15 +1,20 @@
 //! Complete Go binary metadata dump.
 //!
-//! Usage: `cargo run --example dump -- <path-to-go-binary>`
+//! Usage: `cargo run --example dump -- [--explain] <path-to-go-binary>`
 //!
 //! Outputs ALL extractable metadata in a structured, grep-friendly format.
 //! User code is listed first, followed by standard library, then runtime internals.
+//!
+//! `--explain` prints the structured detection report regardless of outcome,
+//! making it the right mode for diagnosing "why was this binary not detected
+//! as Go?" or "why is the confidence Medium instead of High?".
 
 use std::collections::BTreeMap;
 
 use gobin::{
     GoBinary,
-    metadata::{FunctionInfo, extract_functions},
+    detection::{ConfidenceReport, ConfidenceSignal, ParseError},
+    metadata::FunctionInfo,
     structures::{
         Arch,
         types::{GoType, TypeDetail},
@@ -17,14 +22,33 @@ use gobin::{
 };
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <go-binary>", args[0]);
-        std::process::exit(1);
+    let raw: Vec<String> = std::env::args().collect();
+    let mut explain = false;
+    let mut path: Option<String> = None;
+    for arg in raw.iter().skip(1) {
+        match arg.as_str() {
+            "--explain" => explain = true,
+            "-h" | "--help" => {
+                println!("Usage: {} [--explain] <go-binary>", raw[0]);
+                return;
+            }
+            other if path.is_none() => path = Some(other.to_string()),
+            other => {
+                eprintln!("Unexpected argument: {}", other);
+                eprintln!("Usage: {} [--explain] <go-binary>", raw[0]);
+                std::process::exit(2);
+            }
+        }
     }
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("Usage: {} [--explain] <go-binary>", raw[0]);
+            std::process::exit(2);
+        }
+    };
 
-    let path = &args[1];
-    let data = match std::fs::read(path) {
+    let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error reading {}: {}", path, e);
@@ -32,25 +56,67 @@ fn main() {
         }
     };
 
-    let bin = match GoBinary::parse(&data) {
-        Some(b) => b,
-        None => {
-            eprintln!("{}: Not a Go binary", path);
+    let bin = match GoBinary::try_parse(&data) {
+        Ok(b) => b,
+        Err(ParseError::NotAGoBinary { report }) => {
+            eprintln!("{}: not a Go binary", path);
+            print_report(&report);
             std::process::exit(1);
         }
     };
 
+    if explain {
+        print_report(bin.report());
+        println!();
+    }
+
     let pclntab = bin.pclntab();
-    let funcs = pclntab.map(|p| extract_functions(p)).unwrap_or_default();
+    let funcs: Vec<FunctionInfo<'_>> = bin.functions().collect();
     let files: Vec<&str> = pclntab
         .map(|p| p.file_names().collect())
         .unwrap_or_default();
-    let types = bin.types();
+    let types: Vec<_> = bin.types().collect();
 
-    print_header(&bin, &funcs, &files, path, data.len());
+    print_header(&bin, &funcs, &files, &path, data.len());
     print_build_info(&bin);
     print_functions_and_packages(&funcs, &types);
     print_source_files(&files);
+}
+
+fn print_report(report: &ConfidenceReport) {
+    eprintln!("[Detection report] tier = {:?}", report.tier);
+    if report.signals.is_empty() {
+        eprintln!("  (no signals collected)");
+        return;
+    }
+    for signal in &report.signals {
+        match signal {
+            ConfidenceSignal::GopclntabSectionPresent => {
+                eprintln!("  [+] gopclntab section present")
+            }
+            ConfidenceSignal::BuildinfoSectionPresent => {
+                eprintln!("  [+] buildinfo section present")
+            }
+            ConfidenceSignal::BuildidNotePresent => eprintln!("  [+] build-id note present"),
+            ConfidenceSignal::BuildIdMarkerFound => eprintln!("  [+] build-id raw marker found"),
+            ConfidenceSignal::BuildinfoParsed => eprintln!("  [+] buildinfo blob parsed"),
+            ConfidenceSignal::BuildinfoMissing { reason } => {
+                eprintln!("  [-] buildinfo missing: {}", reason)
+            }
+            ConfidenceSignal::PclntabParsed { version, nfunc } => {
+                eprintln!("  [+] pclntab parsed: {:?} ({} funcs)", version, nfunc)
+            }
+            ConfidenceSignal::PclntabMissing { reason } => {
+                eprintln!("  [-] pclntab missing: {}", reason)
+            }
+            ConfidenceSignal::GoVersionString { version, source } => {
+                eprintln!("  [+] go version: {} (source: {:?})", version, source)
+            }
+            ConfidenceSignal::HeuristicStringsMatched { hits } => {
+                eprintln!("  [+] heuristic strings matched: {}", hits)
+            }
+        }
+    }
 }
 
 fn print_header(
@@ -126,7 +192,7 @@ fn print_build_info(bin: &GoBinary<'_>) {
         println!("  Main path    : {}", path);
     }
     if let Some(ref module) = info.main_module {
-        let ver = info.main_version.as_deref().unwrap_or("");
+        let ver = info.main_version.unwrap_or("");
         println!("  Module       : {} {}", module, ver);
     }
 
@@ -159,8 +225,20 @@ fn print_build_info(bin: &GoBinary<'_>) {
     // Dependencies
     if !info.deps.is_empty() {
         println!("  Dependencies ({}):", info.deps.len());
-        for (dep, version) in &info.deps {
-            println!("    {} {}", dep, version.as_deref().unwrap_or(""));
+        for dep in &info.deps {
+            print!("    {} {}", dep.path, dep.version.unwrap_or(""),);
+            if let Some(ref sum) = dep.sum {
+                print!("  {}", sum);
+            }
+            println!();
+            if let Some(ref r) = dep.replacement {
+                println!(
+                    "      => {} {}{}",
+                    r.path,
+                    r.version.unwrap_or(""),
+                    r.sum.map(|s| format!("  {}", s)).unwrap_or_default(),
+                );
+            }
         }
         println!();
     }
@@ -267,8 +345,8 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                 }
                 tags.push(format!("hash:0x{:08x}", t.hash));
                 match &t.detail {
-                    TypeDetail::Array { len } => tags.push(format!("len:{}", len)),
-                    TypeDetail::Chan { dir } => {
+                    TypeDetail::Array { len, .. } => tags.push(format!("len:{}", len)),
+                    TypeDetail::Chan { dir, .. } => {
                         let d = match dir {
                             1 => "<-chan",
                             2 => "chan<-",
@@ -280,6 +358,7 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                         in_count,
                         out_count,
                         is_variadic,
+                        ..
                     } => {
                         tags.push(format!("in:{}", in_count));
                         tags.push(format!("out:{}", out_count));
@@ -287,11 +366,12 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                             tags.push("variadic".into());
                         }
                     }
-                    TypeDetail::Interface { method_count } => {
+                    TypeDetail::Interface { method_count, .. } => {
                         tags.push(format!("iface_methods:{}", method_count));
                     }
-                    TypeDetail::Map => {}
-                    TypeDetail::Struct { field_count } => {
+                    TypeDetail::Map { .. } => {}
+                    TypeDetail::Pointer { .. } | TypeDetail::Slice { .. } => {}
+                    TypeDetail::Struct { field_count, .. } => {
                         tags.push(format!("fields:{}", field_count));
                     }
                     TypeDetail::None => {}

@@ -37,7 +37,7 @@ pub struct StructTypeExtra {
 impl StructTypeExtra {
     /// Binary size: pointer_size + GoSlice::size(ps).
     pub fn size(ps: u8) -> usize {
-        ps as usize + GoSlice::size(ps)
+        (ps as usize).saturating_add(GoSlice::size(ps))
     }
 
     /// Parse from `data`. Data must start at the struct type extra fields.
@@ -70,7 +70,7 @@ pub struct GoStructField {
 impl GoStructField {
     /// Binary size: 3 * pointer_size.
     pub fn size(ps: u8) -> usize {
-        3 * ps as usize
+        (ps as usize).saturating_mul(3)
     }
 
     /// Parse from `data`. Data must start at the struct field.
@@ -85,7 +85,7 @@ impl GoStructField {
         Some(Self {
             name: read_uintptr(data, 0, ps)?,
             typ: read_uintptr(data, p, ps)?,
-            offset: read_uintptr(data, 2 * p, ps)?,
+            offset: read_uintptr(data, p.saturating_mul(2), ps)?,
         })
     }
 }

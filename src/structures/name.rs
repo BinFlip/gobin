@@ -12,39 +12,49 @@
 //! Optional:  4-byte NameOff to package path (if bit 2 set)
 //! ```
 
+/// Flag bit set on names that are exported (start with an uppercase letter).
+pub const NAME_FLAG_EXPORTED: u8 = 1 << 0;
+/// Flag bit set when the name is followed by a struct tag.
+pub const NAME_FLAG_HAS_TAG: u8 = 1 << 1;
+/// Flag bit set when the name is followed by a `NameOff` package path.
+pub const NAME_FLAG_HAS_PKG_PATH: u8 = 1 << 2;
+/// Flag bit set on struct fields that are embedded (anonymous) in their parent.
+pub const NAME_FLAG_EMBEDDED: u8 = 1 << 3;
+
 /// Decode a Go encoded name from raw bytes.
 ///
 /// Returns the name string, or `None` if the data is malformed.
 pub fn decode_name(data: &[u8]) -> Option<&str> {
-    if data.is_empty() {
-        return None;
-    }
-    let _flags = data[0];
+    decode_name_with_flags(data).map(|(name, _)| name)
+}
+
+/// Decode a Go encoded name and return `(name, flags_byte)`.
+///
+/// Use the `NAME_FLAG_*` constants to interpret the flags. Bit 0 marks
+/// exported, bit 1 has-tag, bit 2 has-pkg-path, bit 3 embedded (struct fields).
+pub fn decode_name_with_flags(data: &[u8]) -> Option<(&str, u8)> {
+    let flags = *data.first()?;
 
     let mut name_len: usize = 0;
-    let mut shift = 0;
-    let mut pos = 1;
+    let mut shift: u32 = 0;
+    let mut pos: usize = 1;
     loop {
-        if pos >= data.len() {
-            return None;
-        }
-        let b = data[pos];
-        name_len |= ((b & 0x7f) as usize) << shift;
-        pos += 1;
+        let b = *data.get(pos)?;
+        name_len |= ((b & 0x7f) as usize).checked_shl(shift)?;
+        pos = pos.checked_add(1)?;
         if b & 0x80 == 0 {
             break;
         }
-        shift += 7;
+        shift = shift.checked_add(7)?;
         if shift > 35 {
             return None;
         }
     }
 
-    if pos + name_len > data.len() {
-        return None;
-    }
-
-    std::str::from_utf8(&data[pos..pos + name_len]).ok()
+    let end = pos.checked_add(name_len)?;
+    let bytes = data.get(pos..end)?;
+    let name = std::str::from_utf8(bytes).ok()?;
+    Some((name, flags))
 }
 
 #[cfg(test)]

@@ -1,0 +1,206 @@
+//! Go-style string literal scanner.
+//!
+//! Go strings are stored as `(ptr, len)` headers — *not* NUL-terminated —
+//! with the actual UTF-8 bytes living in `.rodata` (or equivalent for
+//! non-ELF). A generic strings extractor either misses them entirely or
+//! splits them at internal NULs. This module provides a precise scanner:
+//! it walks pointer-aligned positions in the binary, reads candidate
+//! `(ptr, len)` pairs, validates that the pointer resolves to in-binary
+//! data and that the bytes are valid UTF-8, and yields each as a
+//! [`GoString<'a>`].
+//!
+//! ## Heuristics
+//!
+//! False positives are inherent to a `(u64, u64)` scan — any random pair
+//! that happens to look like `(in-segment ptr, plausible len)` and points
+//! to UTF-8 bytes will match. We minimize them by:
+//!
+//! - Requiring the candidate pointer to translate via [`BinaryContext::va_to_file`].
+//! - Bounding `len` to `[MIN_LEN, MAX_LEN]` (default 2..=4096).
+//! - Excluding pointers that fall inside `[moduledata.text, moduledata.etext)`
+//!   (string data never lives in the code segment).
+//! - Validating the bytes as UTF-8.
+//!
+//! Duplicate yields are *not* filtered — a string referenced from N
+//! different positions yields N times. Consumers that want unique results
+//! can `.collect::<HashSet<_>>()`.
+
+use crate::{
+    formats::BinaryContext,
+    structures::{moduledata::Moduledata, util::read_uintptr},
+};
+
+/// Minimum length we treat as a plausible string. Below this, the noise
+/// floor of false matches dominates.
+const MIN_LEN: usize = 2;
+
+/// Maximum length we treat as a plausible string. Real Go literals are
+/// typically <1KB; 4KB gives generous headroom while filtering the
+/// "random `len` happens to look small" case.
+const MAX_LEN: usize = 4096;
+
+/// One Go string literal recovered by the scanner.
+///
+/// All fields borrow from the underlying binary data via the lifetime `'a`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoString<'a> {
+    /// Virtual address of the string data (the value of the `ptr` field of
+    /// the `(ptr, len)` header that referenced this string).
+    pub va: u64,
+    /// Byte length of the string.
+    pub len: usize,
+    /// The string's UTF-8 bytes, borrowed from the binary.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> GoString<'a> {
+    /// Convenience accessor: try to view the bytes as `&str`. Always succeeds
+    /// for entries yielded by [`GoStringIter`] (which validates UTF-8 before
+    /// emitting), but the conversion is repeated here for callers that
+    /// constructed `GoString` by other means.
+    pub fn as_str(&self) -> Option<&'a str> {
+        std::str::from_utf8(self.bytes).ok()
+    }
+}
+
+/// Streaming iterator over Go string literals discovered in a binary.
+///
+/// Walks the binary's bytes at `ps`-aligned offsets, treating each pair of
+/// adjacent ptr-sized words as a candidate `(ptr, len)` header. Yields one
+/// [`GoString`] per validated header.
+pub struct GoStringIter<'ctx, 'a> {
+    ctx: &'ctx BinaryContext<'a>,
+    pos: usize,
+    ps: usize,
+    /// `[text_start, text_end)`. Pointers into this range are skipped (string
+    /// data never lives in code).
+    text_start: u64,
+    text_end: u64,
+}
+
+impl<'ctx, 'a> GoStringIter<'ctx, 'a> {
+    fn empty(ctx: &'ctx BinaryContext<'a>) -> Self {
+        Self {
+            ctx,
+            pos: 0,
+            ps: 0,
+            text_start: 0,
+            text_end: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for GoStringIter<'_, 'a> {
+    type Item = GoString<'a>;
+
+    fn next(&mut self) -> Option<GoString<'a>> {
+        let ps = self.ps;
+        if ps == 0 {
+            return None;
+        }
+        let ps_u8 = u8::try_from(ps).ok()?;
+        let data = self.ctx.data();
+
+        loop {
+            // Need ps + ps bytes for the (ptr, len) header.
+            let header_end = self.pos.checked_add(ps.checked_mul(2)?)?;
+            if header_end > data.len() {
+                return None;
+            }
+            let header_pos = self.pos;
+            self.pos = self.pos.checked_add(ps)?;
+
+            let va = match read_uintptr(data, header_pos, ps_u8) {
+                Some(v) if v != 0 => v,
+                _ => continue,
+            };
+            // Skip pointers into the text segment.
+            if va >= self.text_start && va < self.text_end {
+                continue;
+            }
+            let len_u64 = match read_uintptr(data, header_pos.checked_add(ps)?, ps_u8) {
+                Some(l) => l,
+                None => continue,
+            };
+            let len = match usize::try_from(len_u64) {
+                Ok(l) if (MIN_LEN..=MAX_LEN).contains(&l) => l,
+                _ => continue,
+            };
+
+            let file_off = match self.ctx.va_to_file(va) {
+                Some(o) => o,
+                None => continue,
+            };
+            let bytes = match data.get(file_off..).and_then(|s| s.get(..len)) {
+                Some(b) => b,
+                None => continue,
+            };
+            if std::str::from_utf8(bytes).is_err() {
+                continue;
+            }
+            return Some(GoString { va, len, bytes });
+        }
+    }
+}
+
+/// Construct a streaming string-literal scanner.
+///
+/// Returns an empty iterator when the binary lacks VA mapping (no goblin
+/// parse succeeded) or has no recoverable moduledata to bound the text
+/// segment.
+pub fn extract_iter<'ctx, 'a>(
+    ctx: &'ctx BinaryContext<'a>,
+    moduledata: Option<&Moduledata>,
+    ptr_size: u8,
+) -> GoStringIter<'ctx, 'a> {
+    let ps = ptr_size as usize;
+    if ps == 0 || !ctx.has_va_mapping() {
+        return GoStringIter::empty(ctx);
+    }
+    let (text_start, text_end) = match moduledata {
+        Some(m) => (m.text, m.etext),
+        // Without moduledata we can't filter text pointers; everything is a
+        // candidate. That's acceptable — the UTF-8 + length filters still
+        // cut most noise.
+        None => (0, 0),
+    };
+    GoStringIter {
+        ctx,
+        pos: 0,
+        ps,
+        text_start,
+        text_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_max_len_constants() {
+        // Sanity check: defaults reflect the documented invariants.
+        assert_eq!(MIN_LEN, 2);
+        assert_eq!(MAX_LEN, 4096);
+    }
+
+    #[test]
+    fn as_str_round_trips_utf8() {
+        let s = GoString {
+            va: 0x1000,
+            len: 5,
+            bytes: b"hello",
+        };
+        assert_eq!(s.as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn as_str_rejects_invalid_utf8() {
+        let s = GoString {
+            va: 0,
+            len: 2,
+            bytes: &[0xff, 0xfe],
+        };
+        assert_eq!(s.as_str(), None);
+    }
+}

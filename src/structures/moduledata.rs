@@ -15,7 +15,11 @@
 //!
 //! Source: `src/runtime/symtab.go:402-450`
 
-use crate::structures::{PclntabVersion, goslice::GoSlice, util::read_uintptr};
+use crate::structures::{
+    PclntabVersion,
+    goslice::GoSlice,
+    util::{advance, advance_n, read_uintptr},
+};
 
 /// Version-specific moduledata layout.
 ///
@@ -51,6 +55,14 @@ pub struct Moduledata {
     pub types: u64,
     /// VA of the types region end.
     pub etypes: u64,
+    /// VA of the start of `.rodata` (Go 1.20+ / V3 / V4 only). `None` for V2.
+    pub rodata: Option<u64>,
+    /// VA used as the base for resolving `funcdata[]` offsets — every value
+    /// returned by [`crate::structures::pclntab::ParsedPclntab::funcdata_at`]
+    /// is added to this base to get the funcdata blob's VA. Go 1.20+ / V3 /
+    /// V4 only; `None` for V2 binaries (where funcdata used a different
+    /// addressing scheme).
+    pub gofunc: Option<u64>,
     /// typelinks slice (present in Go 1.16-1.26, absent in future).
     pub typelinks: Option<GoSlice>,
     /// itablinks slice (present in Go 1.16-1.26, absent in future).
@@ -88,38 +100,38 @@ impl Moduledata {
     ) -> Option<Self> {
         let p = ps as usize;
         let slice_sz = GoSlice::size(ps);
-        let mut off = 0;
+        let mut off: usize = 0;
 
         let pc_header = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
 
         let funcnametab = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
         let cutab = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
         let filetab = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
         let pctab = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
         let pclntable = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
         let ftab = GoSlice::parse(data, off, ps)?;
-        off += slice_sz;
+        off = advance(off, slice_sz)?;
 
         let findfunctab = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
         let minpc = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
         let maxpc = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
 
         let text = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
         let etext = read_uintptr(data, off, ps)?;
-        off += p;
+        off = advance(off, p)?;
 
         // noptrdata, enoptrdata, data, edata, bss, ebss, noptrbss, enoptrbss
-        off += 8 * p;
+        off = advance_n(off, 8, p)?;
 
         let version = match pclntab_version {
             PclntabVersion::Go12 => return None,
@@ -141,15 +153,15 @@ impl Moduledata {
         match version {
             ModuledataVersion::V2 => {
                 // end, gcdata, gcbss (3 uintptrs)
-                off += 3 * p;
+                off = advance_n(off, 3, p)?;
                 let types = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 let etypes = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 // textsectmap (slice)
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let typelinks = GoSlice::parse(data, off, ps)?;
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let itablinks = GoSlice::parse(data, off, ps)?;
 
                 Some(Moduledata {
@@ -167,6 +179,8 @@ impl Moduledata {
                     etext,
                     types,
                     etypes,
+                    rodata: None,
+                    gofunc: None,
                     typelinks: Some(typelinks),
                     itablinks: Some(itablinks),
                     version,
@@ -174,19 +188,21 @@ impl Moduledata {
             }
             ModuledataVersion::V3 => {
                 // covctrs, ecovctrs (2 uintptrs)
-                off += 2 * p;
+                off = advance_n(off, 2, p)?;
                 // end, gcdata, gcbss (3 uintptrs)
-                off += 3 * p;
+                off = advance_n(off, 3, p)?;
                 let types = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 let etypes = read_uintptr(data, off, ps)?;
-                off += p;
-                // rodata, gofunc (2 uintptrs)
-                off += 2 * p;
+                off = advance(off, p)?;
+                let rodata = read_uintptr(data, off, ps)?;
+                off = advance(off, p)?;
+                let gofunc = read_uintptr(data, off, ps)?;
+                off = advance(off, p)?;
                 // textsectmap (slice)
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let typelinks = GoSlice::parse(data, off, ps)?;
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let itablinks = GoSlice::parse(data, off, ps)?;
 
                 Some(Moduledata {
@@ -204,6 +220,8 @@ impl Moduledata {
                     etext,
                     types,
                     etypes,
+                    rodata: Some(rodata),
+                    gofunc: Some(gofunc),
                     typelinks: Some(typelinks),
                     itablinks: Some(itablinks),
                     version,
@@ -211,19 +229,23 @@ impl Moduledata {
             }
             ModuledataVersion::V4 => {
                 // covctrs, ecovctrs (2 uintptrs)
-                off += 2 * p;
+                off = advance_n(off, 2, p)?;
                 // end, gcdata, gcbss (3 uintptrs)
-                off += 3 * p;
+                off = advance_n(off, 3, p)?;
                 let types = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 let etypes = read_uintptr(data, off, ps)?;
-                off += p;
-                // rodata, gofunc, epclntab (3 uintptrs)
-                off += 3 * p;
+                off = advance(off, p)?;
+                let rodata = read_uintptr(data, off, ps)?;
+                off = advance(off, p)?;
+                let gofunc = read_uintptr(data, off, ps)?;
+                off = advance(off, p)?;
+                // epclntab (1 uintptr)
+                off = advance(off, p)?;
                 // textsectmap (slice)
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let typelinks = GoSlice::parse(data, off, ps)?;
-                off += slice_sz;
+                off = advance(off, slice_sz)?;
                 let itablinks = GoSlice::parse(data, off, ps)?;
 
                 Some(Moduledata {
@@ -241,6 +263,8 @@ impl Moduledata {
                     etext,
                     types,
                     etypes,
+                    rodata: Some(rodata),
+                    gofunc: Some(gofunc),
                     typelinks: Some(typelinks),
                     itablinks: Some(itablinks),
                     version,
@@ -248,13 +272,13 @@ impl Moduledata {
             }
             ModuledataVersion::V5 => {
                 // covctrs, ecovctrs (2 uintptrs)
-                off += 2 * p;
+                off = advance_n(off, 2, p)?;
                 // end, gcdata, gcbss (3 uintptrs)
-                off += 3 * p;
+                off = advance_n(off, 3, p)?;
                 let types = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 let _typedesclen = read_uintptr(data, off, ps)?;
-                off += p;
+                off = advance(off, p)?;
                 let etypes = read_uintptr(data, off, ps)?;
 
                 Some(Moduledata {
@@ -272,6 +296,8 @@ impl Moduledata {
                     etext,
                     types,
                     etypes,
+                    rodata: None,
+                    gofunc: None,
                     typelinks: None,
                     itablinks: None,
                     version,

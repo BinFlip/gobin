@@ -47,7 +47,12 @@
 //! - Linker creation: `src/cmd/link/internal/ld/data.go:2609-2656`
 //! - Modinfo parsing: `src/runtime/debug/mod.go:40-95`
 
-use crate::{detection::find_bytes, formats::BinaryContext, metadata::BuildInfo};
+use crate::{
+    detection::find_bytes,
+    formats::BinaryContext,
+    metadata::{BuildInfo, DepEntry, DepReplacement},
+    structures::util::read_uvarint,
+};
 
 /// Build info magic prefix: `"\xff Go buildinf:"` (14 bytes).
 ///
@@ -95,31 +100,29 @@ const FLAG_VERSION_INL: u8 = 0x02;
 /// For the inline format (Go 1.18+), the version and modinfo strings are decoded
 /// from varint-length-prefixed data immediately after the 32-byte header.
 /// For the pointer format (Go < 1.18), only a version string scan is attempted.
-pub fn extract(ctx: &BinaryContext<'_>) -> Option<BuildInfo> {
+pub fn extract<'a>(ctx: &BinaryContext<'a>) -> Option<BuildInfo<'a>> {
     let data = ctx.data();
     let sections = ctx.sections();
 
     let search_data = if let Some(ref range) = sections.go_buildinfo {
-        let end = (range.offset + range.size).min(data.len());
-        &data[range.offset..end]
+        let raw_end = range.offset.checked_add(range.size)?;
+        let end = raw_end.min(data.len());
+        data.get(range.offset..end)?
     } else {
         data
     };
 
     let magic_pos = find_aligned_magic(search_data)?;
     let header_start = if let Some(ref range) = sections.go_buildinfo {
-        range.offset + magic_pos
+        range.offset.checked_add(magic_pos)?
     } else {
         magic_pos
     };
 
-    if header_start + BUILDINFO_HEADER_SIZE > data.len() {
-        return None;
-    }
-
-    let header = &data[header_start..header_start + BUILDINFO_HEADER_SIZE];
-    let ptr_size = header[14] as usize;
-    let flags = header[15];
+    let header_end = header_start.checked_add(BUILDINFO_HEADER_SIZE)?;
+    let header = data.get(header_start..header_end)?;
+    let ptr_size = (*header.get(14)?) as usize;
+    let flags = *header.get(15)?;
     let _is_big_endian = (flags & FLAG_ENDIAN) != 0;
     let is_inline = (flags & FLAG_VERSION_INL) != 0;
 
@@ -131,7 +134,7 @@ pub fn extract(ctx: &BinaryContext<'_>) -> Option<BuildInfo> {
 
     if is_inline {
         // Go 1.18+: varint-length-prefixed strings after the 32-byte header
-        let payload = &data[header_start + BUILDINFO_HEADER_SIZE..];
+        let payload = data.get(header_end..)?;
         let (version, rest) = read_varint_string(payload)?;
         info.go_version = Some(version);
 
@@ -154,75 +157,65 @@ pub fn extract(ctx: &BinaryContext<'_>) -> Option<BuildInfo> {
 /// We first scan with alignment checking, then fall back to an unaligned scan
 /// in case the section offset shifted the alignment.
 fn find_aligned_magic(data: &[u8]) -> Option<usize> {
-    let mut pos = 0;
-    while pos + BUILDINFO_HEADER_SIZE <= data.len() {
-        if data[pos..].starts_with(BUILDINFO_MAGIC) && (pos % BUILDINFO_ALIGN == 0 || pos == 0) {
+    let mut pos: usize = 0;
+    while let Some(end) = pos.checked_add(BUILDINFO_HEADER_SIZE) {
+        if end > data.len() {
+            break;
+        }
+        let window = data.get(pos..)?;
+        if window.starts_with(BUILDINFO_MAGIC)
+            && (pos.checked_rem(BUILDINFO_ALIGN) == Some(0) || pos == 0)
+        {
             return Some(pos);
         }
-        pos += 1;
+        pos = pos.checked_add(1)?;
     }
     find_bytes(data, BUILDINFO_MAGIC)
 }
 
-/// Read a varint-length-prefixed UTF-8 string, returning the string and remaining data.
-fn read_varint_string(data: &[u8]) -> Option<(String, &[u8])> {
+/// Read a varint-length-prefixed UTF-8 string, returning the string (borrowed)
+/// and the remaining data.
+fn read_varint_string(data: &[u8]) -> Option<(&str, &[u8])> {
     let (len, consumed) = read_uvarint(data)?;
     let len = len as usize;
-    if consumed + len > data.len() {
-        return None;
-    }
-    let s = String::from_utf8(data[consumed..consumed + len].to_vec()).ok()?;
-    Some((s, &data[consumed + len..]))
+    let end = consumed.checked_add(len)?;
+    let bytes = data.get(consumed..end)?;
+    let s = std::str::from_utf8(bytes).ok()?;
+    let rest = data.get(end..)?;
+    Some((s, rest))
 }
 
 /// Read a varint-length-prefixed byte slice (may contain non-UTF-8 sentinel bytes).
 fn read_varint_bytes(data: &[u8]) -> Option<(&[u8], &[u8])> {
     let (len, consumed) = read_uvarint(data)?;
     let len = len as usize;
-    if consumed + len > data.len() {
-        return None;
-    }
-    Some((&data[consumed..consumed + len], &data[consumed + len..]))
+    let end = consumed.checked_add(len)?;
+    let payload = data.get(consumed..end)?;
+    let rest = data.get(end..)?;
+    Some((payload, rest))
 }
 
 /// Strip the 16-byte sentinels and return the UTF-8 text between them.
 fn extract_modinfo_text(data: &[u8]) -> Option<&str> {
-    let start = if data.len() >= 16 && data[..16] == *MOD_INFO_START {
+    let start = if data.len() >= 16 && data.get(..16) == Some(MOD_INFO_START) {
         16
     } else {
         0
     };
-    let end = if data.len() >= 16 && data[data.len() - 16..] == *MOD_INFO_END {
-        data.len() - 16
+    let end = if data.len() >= 16 {
+        let tail_start = data.len().checked_sub(16)?;
+        if data.get(tail_start..) == Some(MOD_INFO_END) {
+            tail_start
+        } else {
+            data.len()
+        }
     } else {
         data.len()
     };
     if start >= end {
         return None;
     }
-    std::str::from_utf8(&data[start..end]).ok()
-}
-
-/// Decode an unsigned LEB128 / base-128 varint.
-///
-/// Each byte contributes 7 data bits (low 7) and 1 continuation bit (high bit).
-/// If the high bit is set, more bytes follow. Maximum 10 bytes (for u64).
-///
-/// This is the same encoding used by Protocol Buffers and Go's `binary.Uvarint`.
-fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        if i >= 10 {
-            return None;
-        }
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, i + 1));
-        }
-        shift += 7;
-    }
-    None
+    std::str::from_utf8(data.get(start..end)?).ok()
 }
 
 /// Parse the tab-delimited modinfo text into [`BuildInfo`] fields.
@@ -231,39 +224,67 @@ fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
 ///
 /// ```text
 /// path\t<import_path>
-/// mod\t<module>\t<version>
-/// dep\t<module>\t<version>\t<hash>
+/// mod\t<module>\t<version>[\t<sum>]
+/// dep\t<module>\t<version>[\t<sum>]
+/// =>\t<replacement_path>[\t<version>][\t<sum>]
 /// build\t<key>=<value>
 /// ```
+///
+/// A `=>` line modifies the dependency on the immediately preceding `dep`
+/// line (or the `mod` line, if no `dep` came first). Source:
+/// `src/runtime/debug/mod.go:97-130` (`modinfo` writer).
 ///
 /// Known build setting keys (from `src/runtime/debug/mod.go:69-95`):
 /// `-buildmode`, `-compiler`, `CGO_ENABLED`, `GOARCH`, `GOOS`, `GOAMD64`,
 /// `GOARM`, `GO386`, `GOFIPS140`, `vcs`, `vcs.revision`, `vcs.time`, `vcs.modified`
-fn parse_modinfo(text: &str, info: &mut BuildInfo) {
+fn parse_modinfo<'a>(text: &'a str, info: &mut BuildInfo<'a>) {
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        let parts: Vec<&'a str> = line.splitn(4, '\t').collect();
         match parts.first() {
-            Some(&"path") if parts.len() >= 2 => {
-                info.main_path = Some(parts[1].to_string());
-            }
-            Some(&"mod") if parts.len() >= 2 => {
-                info.main_module = Some(parts[1].to_string());
-                if parts.len() >= 3 {
-                    info.main_version = Some(parts[2].to_string());
+            Some(&"path") => {
+                if let Some(p) = parts.get(1) {
+                    info.main_path = Some(*p);
                 }
             }
-            Some(&"dep") if parts.len() >= 2 => {
-                let dep = parts[1].to_string();
-                let version = parts.get(2).map(|v| v.to_string());
-                info.deps.push((dep, version));
+            Some(&"mod") => {
+                if let Some(m) = parts.get(1) {
+                    info.main_module = Some(*m);
+                }
+                if let Some(v) = parts.get(2) {
+                    info.main_version = Some(*v);
+                }
             }
-            Some(&"build") if parts.len() >= 2 => {
-                let setting = parts[1].to_string();
+            Some(&"dep") => {
+                if let Some(p) = parts.get(1) {
+                    info.deps.push(DepEntry {
+                        path: p,
+                        version: parts.get(2).copied(),
+                        sum: parts.get(3).copied(),
+                        replacement: None,
+                    });
+                }
+            }
+            Some(&"=>") => {
+                if let Some(p) = parts.get(1) {
+                    let replacement = DepReplacement {
+                        path: p,
+                        version: parts.get(2).copied(),
+                        sum: parts.get(3).copied(),
+                    };
+                    if let Some(last) = info.deps.last_mut() {
+                        last.replacement = Some(replacement);
+                    }
+                }
+            }
+            Some(&"build") => {
+                let setting = match parts.get(1) {
+                    Some(s) => *s,
+                    None => continue,
+                };
                 if let Some((key, value)) = setting.split_once('=') {
-                    info.build_settings
-                        .push((key.to_string(), value.to_string()));
+                    info.build_settings.push((key, value));
                 } else {
-                    info.build_settings.push((setting, String::new()));
+                    info.build_settings.push((setting, ""));
                 }
             }
             _ => {}
@@ -275,48 +296,48 @@ fn parse_modinfo(text: &str, info: &mut BuildInfo) {
 ///
 /// Used as a fallback when the structured build info is unavailable (pre-1.18 binaries
 /// or when the header is corrupted). Finds the first plausible match.
-pub fn find_version_string(data: &[u8]) -> Option<String> {
+pub fn find_version_string(data: &[u8]) -> Option<&str> {
     let pattern = b"go1.";
-    let mut pos = 0;
-    while pos + 8 < data.len() {
-        if let Some(found) = find_bytes(&data[pos..], pattern) {
-            let start = pos + found;
-            let mut end = start + 4;
-            while end < data.len() && end < start + 20 {
-                let ch = data[end];
-                if ch.is_ascii_digit() || ch == b'.' {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            if let Ok(s) = std::str::from_utf8(&data[start..end]) {
-                if s.len() >= 5 && s[4..].starts_with(|c: char| c.is_ascii_digit()) {
-                    return Some(s.to_string());
-                }
-            }
-            pos = start + 4;
-        } else {
-            break;
+    let mut pos: usize = 0;
+    loop {
+        let cutoff = pos.checked_add(8)?;
+        if cutoff >= data.len() {
+            return None;
         }
+        let window = data.get(pos..)?;
+        let found = find_bytes(window, pattern)?;
+        let start = pos.checked_add(found)?;
+        let scan_start = start.checked_add(4)?;
+        let scan_limit = start.checked_add(20)?.min(data.len());
+        let mut end = scan_start;
+        while end < scan_limit {
+            let ch = match data.get(end) {
+                Some(c) => *c,
+                None => break,
+            };
+            if ch.is_ascii_digit() || ch == b'.' {
+                end = end.checked_add(1)?;
+            } else {
+                break;
+            }
+        }
+        if let Some(slice) = data.get(start..end) {
+            if let Ok(s) = std::str::from_utf8(slice) {
+                if s.len() >= 5
+                    && s.get(4..)
+                        .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+                {
+                    return Some(s);
+                }
+            }
+        }
+        pos = scan_start;
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_read_uvarint_single_byte() {
-        assert_eq!(read_uvarint(&[0x08]), Some((8, 1)));
-    }
-
-    #[test]
-    fn test_read_uvarint_multi_byte() {
-        assert_eq!(read_uvarint(&[0x80, 0x01]), Some((128, 2)));
-        assert_eq!(read_uvarint(&[0xac, 0x02]), Some((300, 2)));
-    }
 
     #[test]
     fn test_read_varint_string() {
@@ -331,7 +352,7 @@ mod tests {
         let mut data = vec![0u8; 100];
         data[50..58].copy_from_slice(b"go1.26.1");
         data[58] = 0;
-        assert_eq!(find_version_string(&data).as_deref(), Some("go1.26.1"));
+        assert_eq!(find_version_string(&data), Some("go1.26.1"));
     }
 
     #[test]
@@ -339,10 +360,35 @@ mod tests {
         let text = "path\texample.com/app\nmod\texample.com/app\t(devel)\ndep\texample.com/dep\tv1.0.0\nbuild\t-compiler=gc\nbuild\tGOOS=linux\n";
         let mut info = BuildInfo::default();
         parse_modinfo(text, &mut info);
-        assert_eq!(info.main_path.as_deref(), Some("example.com/app"));
-        assert_eq!(info.main_module.as_deref(), Some("example.com/app"));
+        assert_eq!(info.main_path, Some("example.com/app"));
+        assert_eq!(info.main_module, Some("example.com/app"));
         assert_eq!(info.deps.len(), 1);
-        assert_eq!(info.deps[0].0, "example.com/dep");
+        assert_eq!(info.deps[0].path, "example.com/dep");
+        assert_eq!(info.deps[0].version, Some("v1.0.0"));
+        assert_eq!(info.deps[0].sum, None);
+        assert!(info.deps[0].replacement.is_none());
         assert_eq!(info.build_settings.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_modinfo_with_sum_and_replace() {
+        let text = "\
+path\texample.com/app
+dep\texample.com/lib\tv1.0.0\th1:abc=
+=>\texample.com/forked\tv1.0.1\th1:def=
+dep\texample.com/local\tv0.0.0
+=>\t./vendored
+";
+        let mut info = BuildInfo::default();
+        parse_modinfo(text, &mut info);
+        assert_eq!(info.deps.len(), 2);
+        assert_eq!(info.deps[0].sum, Some("h1:abc="));
+        let r0 = info.deps[0].replacement.as_ref().unwrap();
+        assert_eq!(r0.path, "example.com/forked");
+        assert_eq!(r0.version, Some("v1.0.1"));
+        assert_eq!(r0.sum, Some("h1:def="));
+        let r1 = info.deps[1].replacement.as_ref().unwrap();
+        assert_eq!(r1.path, "./vendored");
+        assert_eq!(r1.version, None);
     }
 }
