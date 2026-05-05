@@ -45,7 +45,7 @@
 //! Data section's individual segments so runtime structures (pclntab,
 //! moduledata, type descriptors) that span multiple disjoint segments can
 //! be addressed by their linear-memory VA — see
-//! [`structures::wasm`](crate::structures::wasm) and the [`BinaryFormat::Wasm`]
+//! [`structures::wasm`] and the [`BinaryFormat::Wasm`]
 //! variant rustdoc for details.
 //!
 //! ## Architecture
