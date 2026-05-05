@@ -25,6 +25,7 @@
 
 use crate::{
     formats::{BinaryContext, BinaryFormat},
+    metadata::{is_internal_path, is_runtime_path, is_stdlib_path},
     structures::{
         PclntabVersion,
         abitype::AbiType,
@@ -127,6 +128,17 @@ pub struct InterfaceMethod<'a> {
 /// These are parsed from the binary and surfaced here, with structural detail
 /// (field/method names, key/value types, element types) preserved for
 /// downstream type-shape similarity work.
+///
+/// # Stability
+///
+/// Consumers persist this enum's *kind tag* into long-lived schemas
+/// (database columns, structured logs). The contract:
+///
+/// - **Variants** — append-only. New kinds appear as new variants; existing
+///   variants are never renamed or removed.
+/// - **[`Self::kind_str`]** — fixed forever once shipped; treat the
+///   returned strings as serialization keys.
+/// - **`Debug` strings** — *not* a stability surface.
 #[derive(Debug, Clone)]
 pub enum TypeDetail<'a> {
     /// No extra detail (scalar types, string, unsafe.Pointer).
@@ -200,6 +212,73 @@ pub enum TypeDetail<'a> {
     },
 }
 
+impl<'a> TypeDetail<'a> {
+    /// Stable lowercase identifier for the structural-detail variant
+    /// (`"none"` / `"array"` / `"chan"` / `"func"` / `"interface"` /
+    /// `"map"` / `"pointer"` / `"slice"` / `"struct"`). See the
+    /// `# Stability` section on [`TypeDetail`] for the durability contract.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Array { .. } => "array",
+            Self::Chan { .. } => "chan",
+            Self::Func { .. } => "func",
+            Self::Interface { .. } => "interface",
+            Self::Map { .. } => "map",
+            Self::Pointer { .. } => "pointer",
+            Self::Slice { .. } => "slice",
+            Self::Struct { .. } => "struct",
+        }
+    }
+
+    /// Array length for `Self::Array`, otherwise `None`.
+    pub fn array_len(&self) -> Option<u64> {
+        match self {
+            Self::Array { len, .. } => Some(*len),
+            _ => None,
+        }
+    }
+
+    /// Channel direction for `Self::Chan`, otherwise `None`.
+    ///
+    /// Encoding (matches `abi.ChanDir`): `1 = recv-only`, `2 = send-only`,
+    /// `3 = bidirectional`.
+    pub fn chan_dir(&self) -> Option<u64> {
+        match self {
+            Self::Chan { dir, .. } => Some(*dir),
+            _ => None,
+        }
+    }
+
+    /// `(in_count, out_count)` arity for `Self::Func`, otherwise `None`.
+    pub fn func_arity(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::Func {
+                in_count,
+                out_count,
+                ..
+            } => Some((*in_count, *out_count)),
+            _ => None,
+        }
+    }
+
+    /// Field count for `Self::Struct`, otherwise `None`.
+    pub fn struct_field_count(&self) -> Option<u64> {
+        match self {
+            Self::Struct { field_count, .. } => Some(*field_count),
+            _ => None,
+        }
+    }
+
+    /// Method count for `Self::Interface`, otherwise `None`.
+    pub fn interface_method_count(&self) -> Option<u64> {
+        match self {
+            Self::Interface { method_count, .. } => Some(*method_count),
+            _ => None,
+        }
+    }
+}
+
 impl<'a> GoType<'a> {
     /// Extract the package path from the type name.
     ///
@@ -215,14 +294,13 @@ impl<'a> GoType<'a> {
                 s = rest;
             }
         }
-        if s.starts_with('[') {
-            if let Some(bracket_end) = s.find(']') {
-                if let Some(after) = bracket_end.checked_add(1).and_then(|i| s.get(i..)) {
-                    s = after;
-                    while let Some(rest) = s.strip_prefix('*') {
-                        s = rest;
-                    }
-                }
+        if s.starts_with('[')
+            && let Some(bracket_end) = s.find(']')
+            && let Some(after) = bracket_end.checked_add(1).and_then(|i| s.get(i..))
+        {
+            s = after;
+            while let Some(rest) = s.strip_prefix('*') {
+                s = rest;
             }
         }
         if let Some(rest) = s.strip_prefix("map[") {
@@ -234,6 +312,28 @@ impl<'a> GoType<'a> {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-')
         })
+    }
+
+    /// Whether this type belongs to the Go runtime (`runtime` /
+    /// `runtime/<sub>` package). Mirrors
+    /// [`crate::metadata::FunctionInfo::is_runtime`] so type-side and
+    /// function-side classifications agree on one canonical rule.
+    pub fn is_runtime(&self) -> bool {
+        self.package().is_some_and(is_runtime_path)
+    }
+
+    /// Whether this type belongs to a Go-internal package (runtime,
+    /// `internal/*`, `vendor/*`, or compiler-emitted pseudo-paths).
+    pub fn is_internal(&self) -> bool {
+        self.package().is_some_and(is_internal_path)
+    }
+
+    /// Whether this type belongs to the Go standard library (not user code,
+    /// not runtime internals). Stdlib package paths never contain `.`;
+    /// third-party deps do (`github.com/...`, `golang.org/x/...`,
+    /// `gopkg.in/...`).
+    pub fn is_stdlib(&self) -> bool {
+        self.package().is_some_and(is_stdlib_path)
     }
 }
 
@@ -372,8 +472,8 @@ impl std::fmt::Display for TypeKind {
 /// Backed by [`extract_types_iter`]. Each [`Iterator::next`] call parses one
 /// `abi.Type` lazily — no `Vec` is allocated up front. Skips any descriptor
 /// that fails to parse (adversarial input cannot panic the iteration).
-pub struct TypeIter<'ctx, 'a> {
-    ctx: &'ctx BinaryContext<'a>,
+pub struct TypeIter<'a> {
+    ctx: &'a BinaryContext<'a>,
     data: &'a [u8],
     types_base_va: u64,
     ps: u8,
@@ -389,11 +489,11 @@ enum TypeIterStrategy<'a> {
     Empty,
 }
 
-impl<'ctx, 'a> TypeIter<'ctx, 'a> {
-    fn empty(ctx: &'ctx BinaryContext<'a>) -> Self {
+impl<'a> TypeIter<'a> {
+    fn empty(ctx: &'a BinaryContext<'a>) -> Self {
         Self {
             ctx,
-            data: ctx.data(),
+            data: ctx.structure_search_data(),
             types_base_va: 0,
             ps: 0,
             strategy: TypeIterStrategy::Empty,
@@ -401,7 +501,7 @@ impl<'ctx, 'a> TypeIter<'ctx, 'a> {
     }
 }
 
-impl<'a> Iterator for TypeIter<'_, 'a> {
+impl<'a> Iterator for TypeIter<'a> {
     type Item = GoType<'a>;
 
     fn next(&mut self) -> Option<GoType<'a>> {
@@ -417,16 +517,16 @@ impl<'a> Iterator for TypeIter<'_, 'a> {
                     let type_off = i32::from_le_bytes(bytes);
                     let type_va =
                         (self.types_base_va as i64).saturating_add(type_off as i64) as u64;
-                    if let Some(file_off) = self.ctx.va_to_file(type_va) {
-                        if let Some(go_type) = parse_type_at(
+                    if let Some(file_off) = self.ctx.va_to_file(type_va)
+                        && let Some(go_type) = parse_type_at(
                             self.data,
                             file_off,
                             self.types_base_va,
                             self.ps,
                             self.ctx,
-                        ) {
-                            return Some(go_type);
-                        }
+                        )
+                    {
+                        return Some(go_type);
                     }
                     // Failed to parse this entry — fall through to the next.
                 }
@@ -482,23 +582,29 @@ impl<'a> Iterator for TypeIter<'_, 'a> {
 /// 2. `moduledata.typelinks` slice (PE / older Go).
 /// 3. Descriptor walk over `[types .. etypes]`.
 /// 4. Empty iterator if none of the above is available.
-pub fn extract_types_iter<'ctx, 'a>(
-    ctx: &'ctx BinaryContext<'a>,
+pub fn extract_types_iter<'a>(
+    ctx: &'a BinaryContext<'a>,
     ptr_size: u8,
     pclntab_version: Option<PclntabVersion>,
     pclntab_offset: Option<usize>,
     go_version_minor: Option<u32>,
-) -> TypeIter<'ctx, 'a> {
+) -> TypeIter<'a> {
     if !ctx.has_va_mapping() {
         return TypeIter::empty(ctx);
     }
 
-    let data = ctx.data();
+    // Read all runtime structures through the address-space view: file
+    // bytes for ELF/Mach-O/PE, the reconstructed linear-memory image for
+    // wasm. Wasm pclntab/moduledata/types live in linear memory and span
+    // multiple disjoint data segments, so accessing them via file offsets
+    // alone would split structures at segment boundaries.
+    let data = ctx.structure_search_data();
     let sections = ctx.sections();
     let pv = pclntab_version.unwrap_or(PclntabVersion::Go120);
     let has_typelink = sections.typelink.is_some();
 
-    // Find moduledata: dedicated section, or PE pointer-scan discovery.
+    // Find moduledata: dedicated section, PE pointer-scan, or wasm
+    // linear-memory pointer-scan.
     let moduledata = if let Some(ref range) = sections.go_module {
         let end = match range.offset.checked_add(range.size) {
             Some(e) => e,
@@ -509,8 +615,8 @@ pub fn extract_types_iter<'ctx, 'a>(
             None => return TypeIter::empty(ctx),
         };
         Moduledata::parse(md_data, ptr_size, pv, has_typelink, go_version_minor)
-    } else if ctx.format() == BinaryFormat::Pe {
-        discover_moduledata_pe(
+    } else if matches!(ctx.format(), BinaryFormat::Pe | BinaryFormat::Wasm) {
+        discover_moduledata_via_pcheader(
             ctx,
             ptr_size,
             pv,
@@ -528,37 +634,33 @@ pub fn extract_types_iter<'ctx, 'a>(
     };
 
     // Strategy 1: dedicated typelink section.
-    if let Some(ref range) = sections.typelink {
-        if let Some(end) = range.offset.checked_add(range.size) {
-            if let Some(tl_data) = data.get(range.offset..end) {
-                return TypeIter {
-                    ctx,
-                    data,
-                    types_base_va: md.types,
-                    ps: ptr_size,
-                    strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
-                };
-            }
-        }
+    if let Some(ref range) = sections.typelink
+        && let Some(end) = range.offset.checked_add(range.size)
+        && let Some(tl_data) = data.get(range.offset..end)
+    {
+        return TypeIter {
+            ctx,
+            data,
+            types_base_va: md.types,
+            ps: ptr_size,
+            strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
+        };
     }
 
     // Strategy 1b: typelinks slice from moduledata (Go 1.16-1.26 PE).
-    if let Some(ref tl_slice) = md.typelinks {
-        if let Some(tl_file_off) = ctx.va_to_file(tl_slice.ptr) {
-            if let Some(tl_byte_len) = (tl_slice.len as usize).checked_mul(4) {
-                if let Some(tl_end) = tl_file_off.checked_add(tl_byte_len) {
-                    if let Some(tl_data) = data.get(tl_file_off..tl_end) {
-                        return TypeIter {
-                            ctx,
-                            data,
-                            types_base_va: md.types,
-                            ps: ptr_size,
-                            strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
-                        };
-                    }
-                }
-            }
-        }
+    if let Some(ref tl_slice) = md.typelinks
+        && let Some(tl_file_off) = ctx.va_to_file(tl_slice.ptr)
+        && let Some(tl_byte_len) = (tl_slice.len as usize).checked_mul(4)
+        && let Some(tl_end) = tl_file_off.checked_add(tl_byte_len)
+        && let Some(tl_data) = data.get(tl_file_off..tl_end)
+    {
+        return TypeIter {
+            ctx,
+            data,
+            types_base_va: md.types,
+            ps: ptr_size,
+            strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
+        };
     }
 
     // Strategy 2: walk the type descriptor region.
@@ -579,12 +681,15 @@ pub fn extract_types_iter<'ctx, 'a>(
     TypeIter::empty(ctx)
 }
 
-/// Find moduledata in a PE binary by scanning `.data` for the pclntab VA pointer.
+/// Find moduledata by scanning the address-space view for a pointer-aligned
+/// value equal to the pclntab's VA.
 ///
 /// The first field of moduledata is `pcHeader *pcHeader`, which points to the
-/// pclntab. We find the pclntab VA from its file offset, then scan the `.data`
-/// section for that pointer value at pointer-aligned positions.
-fn discover_moduledata_pe(
+/// pclntab. For PE we scan `data` (file bytes) for that pointer at pointer-
+/// aligned positions; for wasm we scan the reconstructed linear-memory image
+/// the same way (offsets in the image are linear-memory addresses, exactly
+/// what the runtime stores).
+fn discover_moduledata_via_pcheader(
     ctx: &BinaryContext<'_>,
     ps: u8,
     pv: PclntabVersion,
@@ -592,19 +697,23 @@ fn discover_moduledata_pe(
     go_version_minor: Option<u32>,
     pclntab_offset: Option<usize>,
 ) -> Option<Moduledata> {
-    let data = ctx.data();
-    let pclntab_file_off = pclntab_offset?;
-    let pclntab_va = ctx.file_to_va(pclntab_file_off)?;
+    let data = ctx.structure_search_data();
+    let pclntab_off = pclntab_offset?;
+    // For wasm the pclntab "offset" already IS its linear-memory address (the
+    // pcHeader was discovered inside the LM image). For PE, translate via
+    // segments.
+    let pclntab_va = if ctx.format() == BinaryFormat::Wasm {
+        pclntab_off as u64
+    } else {
+        ctx.file_to_va(pclntab_off)?
+    };
 
     let p = ps as usize;
 
-    // Find .data section by looking for a PE section containing writable data
-    // We scan the entire binary for the pclntab VA at pointer-aligned offsets
-    // within data sections (typically the latter half of the binary)
     if p == 0 {
         return None;
     }
-    let search_start = data.len().checked_div(4).unwrap_or(0); // Skip text/code section
+    let search_start = data.len().checked_div(4).unwrap_or(0); // skip code region
     let target_bytes = match ps {
         4 => (pclntab_va as u32).to_le_bytes().to_vec(),
         8 => pclntab_va.to_le_bytes().to_vec(),
@@ -634,7 +743,8 @@ fn discover_moduledata_pe(
                 None => break,
             };
             if let Some(md) = Moduledata::parse(remaining, ps, pv, has_typelink, go_version_minor) {
-                // Sanity checks
+                // Sanity checks: PC bounds non-empty, type region present,
+                // and funcnametab pointer resolvable.
                 if md.minpc < md.maxpc
                     && md.types != 0
                     && ctx.va_to_file(md.funcnametab.ptr).is_some()

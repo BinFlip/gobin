@@ -35,6 +35,36 @@ use crate::{
     structures::pclntab::{FuncData, FuncEntryIter, ParsedPclntab},
 };
 
+/// Whether `pkg` is a Go runtime package (`runtime` or `runtime/<sub>`).
+///
+/// Shared with [`crate::structures::types::GoType::is_runtime`] so type-side
+/// and function-side classifications agree on one canonical rule.
+pub fn is_runtime_path(pkg: &str) -> bool {
+    pkg == "runtime" || pkg.starts_with("runtime/")
+}
+
+/// Whether `pkg` is a Go-internal package (runtime, `internal/*`, `vendor/*`,
+/// or compiler-emitted pseudo-paths like `type:*`).
+///
+/// Shared between [`FunctionInfo::is_internal`] and
+/// [`crate::structures::types::GoType::is_internal`].
+pub fn is_internal_path(pkg: &str) -> bool {
+    is_runtime_path(pkg)
+        || pkg.starts_with("internal/")
+        || pkg.starts_with("vendor/")
+        || pkg.starts_with("type:")
+}
+
+/// Whether `pkg` is a Go standard-library package.
+///
+/// Stdlib package paths never contain `.` (third-party dependencies use
+/// domain-shaped paths like `github.com/...`, `golang.org/x/...`,
+/// `gopkg.in/...`). Internal/runtime packages are excluded so this answers
+/// "user-visible stdlib" rather than "anything Google ships."
+pub fn is_stdlib_path(pkg: &str) -> bool {
+    !is_internal_path(pkg) && !pkg.contains('.')
+}
+
 /// Which Go toolchain produced the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compiler {
@@ -85,6 +115,18 @@ pub struct DepReplacement<'a> {
 ///
 /// **Sealed**: not marked `#[non_exhaustive]`. Adding a variant is a breaking
 /// API change so callers can rely on exhaustive match.
+///
+/// # Stability
+///
+/// Consumers persist this enum into long-lived schemas (database columns,
+/// structured logs). The contract:
+///
+/// - **Variants** — append-only. New obfuscators appear as new variants;
+///   existing variants are never renamed or removed.
+/// - **`Display` strings** (and [`Self::kind_str`]) — fixed forever once
+///   shipped. Treat them as serialization keys.
+/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+///   `kind_str` for anything that lands in a database column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObfuscationKind {
     /// No obfuscation indicators detected.
@@ -101,6 +143,32 @@ pub enum ObfuscationKind {
         /// Short reason describing what was observed.
         reason: String,
     },
+}
+
+impl ObfuscationKind {
+    /// Stable lowercase identifier for this verdict
+    /// (`"none"` / `"garble"` / `"other"`).
+    ///
+    /// Drops the inner `confidence` and `reason` payloads — read those off
+    /// the matched variant directly. See the `# Stability` section on
+    /// [`ObfuscationKind`] for the durability contract.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Garble { .. } => "garble",
+            Self::Other { .. } => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for ObfuscationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::Garble { confidence } => write!(f, "garble({confidence})"),
+            Self::Other { reason } => write!(f, "other({reason})"),
+        }
+    }
 }
 
 /// Structural description of a method receiver type parsed from a function name.
@@ -310,13 +378,13 @@ fn package_boundary(name: &str) -> Option<usize> {
     let mut boundary = last_slash.checked_add(first_dot)?;
 
     let after_start = boundary.checked_add(1)?;
-    if let Some(after) = name.get(after_start..) {
-        if let Some(rest) = after.strip_prefix('v') {
-            let digit_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-            if digit_end > 0 && rest.as_bytes().get(digit_end) == Some(&b'.') {
-                // boundary advances by '.' + 'v' + N digits = 2 + digit_end
-                boundary = boundary.checked_add(2)?.checked_add(digit_end)?;
-            }
+    if let Some(after) = name.get(after_start..)
+        && let Some(rest) = after.strip_prefix('v')
+    {
+        let digit_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_end > 0 && rest.as_bytes().get(digit_end) == Some(&b'.') {
+            // boundary advances by '.' + 'v' + N digits = 2 + digit_end
+            boundary = boundary.checked_add(2)?.checked_add(digit_end)?;
         }
     }
     Some(boundary)
@@ -325,6 +393,19 @@ fn package_boundary(name: &str) -> Option<usize> {
 /// The Go `-buildmode` value the binary was compiled with.
 ///
 /// Source: `src/cmd/go/internal/work/init.go` (`-buildmode` flag definitions).
+///
+/// # Stability
+///
+/// Consumers persist this enum into long-lived schemas (database columns,
+/// structured logs). The contract:
+///
+/// - **Variants** — append-only. New build modes appear as new variants;
+///   existing variants are never renamed or removed.
+/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+///   shipped. They round-trip through [`Self::parse`]; treat them as
+///   serialization keys.
+/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+///   `as_str` for anything that lands in a database column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildMode {
     /// Default executable (`-buildmode=exe` or unset).
@@ -358,6 +439,34 @@ impl BuildMode {
             "shared" => Self::Shared,
             other => Self::Other(other.to_string()),
         }
+    }
+
+    /// The canonical `-buildmode` flag string, suitable for round-tripping
+    /// through [`Self::parse`].
+    ///
+    /// Returns the same kebab-case identifiers the Go toolchain accepts
+    /// (`"exe"`, `"pie"`, `"c-shared"`, `"c-archive"`, `"plugin"`,
+    /// `"archive"`, `"shared"`). For [`BuildMode::Other`] the inner verbatim
+    /// string is returned as a borrowed `Cow`. See the `# Stability` section
+    /// on [`BuildMode`] for the durability contract.
+    pub fn as_str(&self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::Exe => Cow::Borrowed("exe"),
+            Self::Pie => Cow::Borrowed("pie"),
+            Self::CShared => Cow::Borrowed("c-shared"),
+            Self::CArchive => Cow::Borrowed("c-archive"),
+            Self::Plugin => Cow::Borrowed("plugin"),
+            Self::Archive => Cow::Borrowed("archive"),
+            Self::Shared => Cow::Borrowed("shared"),
+            Self::Other(s) => Cow::Owned(s.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for BuildMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_str())
     }
 }
 
@@ -674,16 +783,12 @@ impl FunctionInfo<'_> {
 
     /// Whether this is a Go internal package (runtime, internal/*, vendor/*).
     pub fn is_internal(&self) -> bool {
-        let pkg = self.package().unwrap_or("");
-        pkg.starts_with("runtime")
-            || pkg.starts_with("internal/")
-            || pkg.starts_with("vendor/")
-            || pkg.starts_with("type:")
+        is_internal_path(self.package().unwrap_or(""))
     }
 
     /// Whether this is a standard library function (not user code, not runtime internals).
     pub fn is_stdlib(&self) -> bool {
-        !self.is_internal() && self.package().is_some_and(|p| !p.contains('.'))
+        self.package().is_some_and(is_stdlib_path)
     }
 
     /// Human-readable FuncID label, if this is a special runtime function.
@@ -791,7 +896,7 @@ pub struct FunctionTables<'a> {
 /// # let data = vec![];
 /// let bin = GoBinary::parse(&data).unwrap();
 /// let pcl = bin.pclntab().unwrap();
-/// for_each_function(pcl, |info, tables| {
+/// for_each_function(&pcl, |info, tables| {
 ///     println!("{}: {} pcln entries", info.name, tables.pcln.len());
 /// });
 /// ```
@@ -870,29 +975,34 @@ where
 /// Skips functions whose `_func` struct fails to parse — adversarial pclntab
 /// data cannot panic the iteration. Yields zero items for binaries without a
 /// recoverable pclntab.
-pub struct FunctionIter<'p, 'a> {
-    inner: Option<FunctionIterInner<'p, 'a>>,
+pub struct FunctionIter<'a> {
+    inner: Option<FunctionIterInner<'a>>,
 }
 
-struct FunctionIterInner<'p, 'a> {
-    pclntab: &'p ParsedPclntab<'a>,
+struct FunctionIterInner<'a> {
+    pclntab: ParsedPclntab<'a>,
     entries: FuncEntryIter<'a>,
 }
 
-impl<'p, 'a> FunctionIter<'p, 'a> {
+impl<'a> FunctionIter<'a> {
     /// Build an iterator that yields one [`FunctionInfo`] per function in the
     /// pclntab. Pass `None` (or an unparsed binary) to get an empty iterator.
-    pub fn new(pclntab: Option<&'p ParsedPclntab<'a>>) -> Self {
+    ///
+    /// Takes the [`ParsedPclntab`] by value because the struct is `Copy` and
+    /// the iterator needs to outlive any temporary borrow the caller might
+    /// have constructed (e.g. on-demand reconstruction from
+    /// [`crate::structures::pclntab::PclntabMeta::attach`]).
+    pub fn new(pclntab: Option<ParsedPclntab<'a>>) -> Self {
         Self {
             inner: pclntab.map(|p| FunctionIterInner {
-                pclntab: p,
                 entries: p.func_entries(),
+                pclntab: p,
             }),
         }
     }
 }
 
-impl<'a> Iterator for FunctionIter<'_, 'a> {
+impl<'a> Iterator for FunctionIter<'a> {
     type Item = FunctionInfo<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {

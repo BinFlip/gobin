@@ -1,3 +1,16 @@
+// Integration tests — workspace-level `[lints.rust]` and `[lints.clippy]`
+// (defined in Cargo.toml) apply to integration test binaries too, but tests
+// legitimately use `unwrap`/`expect`/indexing/arithmetic for terseness, and
+// integration test items don't need rustdoc.
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeSet;
 
 use gobin::{
@@ -15,6 +28,7 @@ const BASIC_WINDOWS: &str = "tests/samples/basic_windows_amd64.exe";
 const BASIC_WINDOWS_STRIPPED: &str = "tests/samples/basic_windows_stripped.exe";
 const MINIMAL_NORMAL: &str = "tests/samples/minimal_normal";
 const MINIMAL_STRIPPED: &str = "tests/samples/minimal_stripped";
+const BASIC_WASM: &str = "tests/samples/basic_wasm.wasm";
 
 fn load(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
@@ -34,6 +48,124 @@ fn detect_elf_go_binary() {
     let bin = GoBinary::parse(&data).expect("Should detect as Go binary");
     assert_eq!(bin.confidence(), Confidence::High);
     assert_eq!(bin.context().format(), BinaryFormat::Elf);
+}
+
+#[test]
+fn detect_wasm_go_binary() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).expect("Should detect wasm Go binary");
+    assert_eq!(bin.context().format(), BinaryFormat::Wasm);
+    assert_eq!(bin.confidence(), Confidence::High);
+    assert!(bin.go_version().unwrap().starts_with("go1."));
+    assert!(bin.build_id().is_some(), "Wasm carries go:buildid section");
+}
+
+#[test]
+fn wasm_pclntab_parses() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pcl = bin
+        .pclntab()
+        .expect("wasm pclntab should parse via reconstructed linear-memory image");
+    assert!(
+        pcl.nfunc > 100,
+        "expected hundreds of functions in stdlib wasm build, got {}",
+        pcl.nfunc
+    );
+    assert_eq!(pcl.ptr_size, 8, "Go wasm uses ptrSize = 8");
+    assert_eq!(pcl.min_lc, 1, "Go wasm uses minLC = 1");
+}
+
+#[test]
+fn wasm_arch_resolves_correctly() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    // pclntab arch can't disambiguate (1,8) — reports X86_64.
+    assert_eq!(bin.pclntab().unwrap().arch(), Arch::X86_64);
+    // bin.arch() folds in the container format and resolves to Wasm.
+    assert_eq!(bin.arch(), Arch::Wasm);
+}
+
+#[test]
+fn wasm_function_iter_yields_runtime_main() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    let names: Vec<&str> = bin.functions().map(|f| f.name).collect();
+    assert!(
+        names.contains(&"runtime.main"),
+        "runtime.main should be reachable via the pclntab funcname table"
+    );
+    assert!(
+        names.contains(&"main.main"),
+        "main.main should be reachable via the pclntab funcname table"
+    );
+    assert!(
+        names.len() > 100,
+        "wasm functions() should yield hundreds of names, got {}",
+        names.len()
+    );
+}
+
+#[test]
+fn wasm_types_extracted() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    let types: Vec<_> = bin.types().collect();
+    assert!(
+        types.len() > 100,
+        "wasm types() should yield hundreds of types, got {}",
+        types.len()
+    );
+    // Spot-check a well-known runtime type.
+    assert!(
+        types.iter().any(|t| t.name.contains("runtime.")),
+        "expected at least one runtime.* type"
+    );
+}
+
+#[test]
+fn wasm_strings_extracted() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    let count = bin.strings().count();
+    assert!(
+        count > 50,
+        "wasm strings() should yield many strings, got {count}"
+    );
+}
+
+#[test]
+fn wasm_inline_tree_yields_entries() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pcl = bin.pclntab().unwrap();
+
+    let mut total_entries = 0usize;
+    for (_, off) in pcl.func_entries().take(200) {
+        let func = match pcl.parse_func(off) {
+            Some(f) => f,
+            None => continue,
+        };
+        total_entries += bin.inline_tree(&func).count();
+        if total_entries > 0 {
+            break;
+        }
+    }
+    assert!(
+        total_entries > 0,
+        "wasm should expose at least one inline-tree entry across the first 200 functions"
+    );
+}
+
+#[test]
+fn wasm_moduledata_resolves_text_va() {
+    let data = load(BASIC_WASM);
+    let bin = GoBinary::parse(&data).unwrap();
+    // moduledata discovery should succeed for wasm via the linear-memory
+    // pcHeader-pointer scan, exposing text/etext.
+    let text = bin.text_va().expect("wasm should resolve runtime.text");
+    let etext = bin.etext_va().expect("wasm should resolve runtime.etext");
+    assert!(etext > text, "etext must follow text");
 }
 
 #[test]
@@ -753,7 +885,7 @@ fn for_each_function_visits_all_functions() {
     let baseline_len = FunctionIter::new(Some(pcl)).count();
     let mut count = 0usize;
     let mut saw_main = false;
-    for_each_function(pcl, |info, tables| {
+    for_each_function(&pcl, |info, tables| {
         count += 1;
         if info.name == "main.main" {
             saw_main = true;
@@ -852,10 +984,7 @@ fn strings_iter_works_on_stripped_binaries() {
     let bound = (normal / 20).max(10);
     assert!(
         (diff as usize) <= bound,
-        "string count drifted: normal={} stripped={} diff={}",
-        normal,
-        stripped,
-        diff,
+        "string count drifted: normal={normal} stripped={stripped} diff={diff}",
     );
 }
 
@@ -1061,12 +1190,359 @@ fn entry_off_translates_to_text_va() {
 }
 
 #[test]
+fn entry_va_matches_manual_translation() {
+    for path in [BASIC_NORMAL, BASIC_LINUX, BASIC_WINDOWS] {
+        let data = load(path);
+        let bin = GoBinary::parse(&data).unwrap();
+        let text_va = bin.text_va().unwrap();
+        let pcl = bin.pclntab().unwrap();
+        let (_, func_off) = pcl.func_entries().next().unwrap();
+        let func = pcl.parse_func(func_off).unwrap();
+
+        let manual = text_va + func.entry_off as u64;
+        assert_eq!(
+            bin.entry_va(&func),
+            Some(manual),
+            "{path}: entry_va must equal text_va + entry_off"
+        );
+    }
+}
+
+#[test]
+fn entry_rva_subtracts_image_base_for_pe() {
+    // PE: entry_rva = entry_va − image_base.
+    let data = load(BASIC_WINDOWS);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pcl = bin.pclntab().unwrap();
+    let (_, func_off) = pcl.func_entries().next().unwrap();
+    let func = pcl.parse_func(func_off).unwrap();
+
+    let image_base = bin.context().image_base();
+    assert!(
+        image_base > 0,
+        "PE image_base should be nonzero (typical: 0x140000000 for amd64 EXE)"
+    );
+    let va = bin.entry_va(&func).unwrap();
+    let rva = bin.entry_rva(&func).unwrap();
+    assert_eq!(rva, va - image_base);
+    assert!(rva < va, "RVA must be smaller than VA for PE");
+}
+
+#[test]
+fn entry_rva_equals_entry_va_for_va_native_formats() {
+    // ELF and Mach-O: image_base is 0, so RVA == VA.
+    for path in [BASIC_NORMAL, BASIC_LINUX] {
+        let data = load(path);
+        let bin = GoBinary::parse(&data).unwrap();
+        assert_eq!(
+            bin.context().image_base(),
+            0,
+            "{path}: VA-native format should report image_base = 0"
+        );
+        let pcl = bin.pclntab().unwrap();
+        let (_, func_off) = pcl.func_entries().next().unwrap();
+        let func = pcl.parse_func(func_off).unwrap();
+        assert_eq!(bin.entry_va(&func), bin.entry_rva(&func));
+    }
+}
+
+#[test]
+fn strings_iter_surfaces_non_utf8_bytes() {
+    // After A-09, the scanner no longer pre-filters on UTF-8. Verify that
+    // (a) bin.strings() never panics on non-UTF-8 hits, and (b) GoString's
+    // as_bytes() / try_as_str() / as_str() agree with each other.
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    let mut total = 0usize;
+    let mut utf8_ok = 0usize;
+    let mut non_utf8 = 0usize;
+    for s in bin.strings() {
+        total += 1;
+        // Raw bytes are always available.
+        assert_eq!(s.as_bytes().len(), s.len);
+        match s.try_as_str() {
+            Ok(text) => {
+                utf8_ok += 1;
+                assert_eq!(s.as_str(), Some(text));
+            }
+            Err(_) => {
+                non_utf8 += 1;
+                assert_eq!(s.as_str(), None);
+            }
+        }
+    }
+    assert!(total > 100, "expected many string hits, got {total}");
+    // We intentionally don't assert non_utf8 > 0 — a stdlib hello binary
+    // may not contain any. The point is the API doesn't drop them.
+    let _ = (utf8_ok, non_utf8);
+}
+
+#[test]
+fn type_classification_helpers_match_function_helpers() {
+    use gobin::metadata::{is_internal_path, is_runtime_path, is_stdlib_path};
+
+    // runtime.* / runtime/internal/* are runtime AND internal, never stdlib
+    assert!(is_runtime_path("runtime"));
+    assert!(is_runtime_path("runtime/internal/atomic"));
+    assert!(is_internal_path("runtime"));
+    assert!(!is_stdlib_path("runtime"));
+
+    // Plain stdlib
+    assert!(is_stdlib_path("net/http"));
+    assert!(is_stdlib_path("encoding/json"));
+    assert!(!is_internal_path("net/http"));
+    assert!(!is_runtime_path("net/http"));
+
+    // Third-party (domain-shaped) is none-of-the-above
+    assert!(!is_stdlib_path("github.com/spf13/cobra"));
+    assert!(!is_internal_path("github.com/spf13/cobra"));
+    assert!(!is_stdlib_path("gopkg.in/yaml.v3"));
+
+    // internal/* is internal but not stdlib
+    assert!(is_internal_path("internal/abi"));
+    assert!(!is_stdlib_path("internal/abi"));
+}
+
+#[test]
+fn go_type_classification_via_real_binary() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    let (mut runtime_ct, mut stdlib_ct, mut user_ct) = (0usize, 0usize, 0usize);
+    for ty in bin.types() {
+        if ty.is_runtime() {
+            runtime_ct += 1;
+        } else if ty.is_stdlib() {
+            stdlib_ct += 1;
+        } else if ty.package().is_some() {
+            user_ct += 1;
+        }
+        // is_internal must be a superset of is_runtime
+        if ty.is_runtime() {
+            assert!(
+                ty.is_internal(),
+                "runtime type must also be internal: {}",
+                ty.name
+            );
+        }
+        // is_stdlib and is_internal must be disjoint
+        assert!(
+            !(ty.is_stdlib() && ty.is_internal()),
+            "type both stdlib AND internal: {}",
+            ty.name
+        );
+    }
+    assert!(
+        runtime_ct > 0,
+        "a Go binary should expose at least one runtime type"
+    );
+    let _ = (stdlib_ct, user_ct);
+}
+
+#[test]
+fn func_data_args_size_returns_unsigned_byte_count() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pcl = bin.pclntab().unwrap();
+
+    let mut saw_nonneg = false;
+    for (_, off) in pcl.func_entries().take(20) {
+        let f = match pcl.parse_func(off) {
+            Some(f) => f,
+            None => continue,
+        };
+        // args_size() never wraps for negative-stored values; non-negative
+        // raw values pass through unchanged.
+        if f.args >= 0 {
+            assert_eq!(f.args_size(), f.args as u32);
+            saw_nonneg = true;
+        }
+    }
+    assert!(
+        saw_nonneg,
+        "expected at least one function with a non-negative args field"
+    );
+}
+
+#[test]
+fn type_detail_scalar_accessors() {
+    use gobin::structures::types::TypeDetail;
+
+    let arr = TypeDetail::Array {
+        len: 16,
+        elem_va: 0,
+    };
+    assert_eq!(arr.array_len(), Some(16));
+    assert_eq!(arr.chan_dir(), None);
+    assert_eq!(arr.func_arity(), None);
+
+    let ch = TypeDetail::Chan { dir: 2, elem_va: 0 };
+    assert_eq!(ch.chan_dir(), Some(2));
+    assert_eq!(ch.array_len(), None);
+
+    let f = TypeDetail::Func {
+        in_count: 3,
+        out_count: 2,
+        is_variadic: false,
+        inputs: vec![],
+        outputs: vec![],
+    };
+    assert_eq!(f.func_arity(), Some((3, 2)));
+
+    let s = TypeDetail::Struct {
+        field_count: 5,
+        fields: vec![],
+    };
+    assert_eq!(s.struct_field_count(), Some(5));
+
+    let i = TypeDetail::Interface {
+        method_count: 7,
+        methods: vec![],
+    };
+    assert_eq!(i.interface_method_count(), Some(7));
+
+    // None cases
+    let n = TypeDetail::None;
+    assert_eq!(n.array_len(), None);
+    assert_eq!(n.chan_dir(), None);
+    assert_eq!(n.func_arity(), None);
+    assert_eq!(n.struct_field_count(), None);
+    assert_eq!(n.interface_method_count(), None);
+}
+
+#[test]
+fn enum_display_strings_are_stable() {
+    use gobin::structures::types::TypeDetail;
+
+    // Confidence
+    assert_eq!(format!("{}", Confidence::None), "none");
+    assert_eq!(format!("{}", Confidence::Low), "low");
+    assert_eq!(format!("{}", Confidence::Medium), "medium");
+    assert_eq!(format!("{}", Confidence::High), "high");
+
+    // PclntabVersion
+    assert_eq!(format!("{}", PclntabVersion::Go12), "go12");
+    assert_eq!(format!("{}", PclntabVersion::Go116), "go116");
+    assert_eq!(format!("{}", PclntabVersion::Go118), "go118");
+    assert_eq!(format!("{}", PclntabVersion::Go120), "go120");
+
+    // Arch — values match canonical GOARCH where they exist
+    assert_eq!(format!("{}", Arch::X86), "386");
+    assert_eq!(format!("{}", Arch::X86_64), "amd64");
+    assert_eq!(format!("{}", Arch::Arm64), "arm64");
+    assert_eq!(format!("{}", Arch::Wasm), "wasm");
+    assert_eq!(format!("{}", Arch::Unknown), "unknown");
+
+    // TypeDetail::kind_str
+    assert_eq!(TypeDetail::None.kind_str(), "none");
+    assert_eq!(
+        TypeDetail::Array {
+            len: 4,
+            elem_va: 0x1000
+        }
+        .kind_str(),
+        "array"
+    );
+    assert_eq!(
+        TypeDetail::Chan {
+            dir: 3,
+            elem_va: 0x1000
+        }
+        .kind_str(),
+        "chan"
+    );
+    assert_eq!(
+        TypeDetail::Map {
+            key_va: 0x1,
+            elem_va: 0x2
+        }
+        .kind_str(),
+        "map"
+    );
+}
+
+#[test]
+fn build_mode_as_str_round_trips_through_parse() {
+    use gobin::metadata::BuildMode;
+    let cases = [
+        BuildMode::Exe,
+        BuildMode::Pie,
+        BuildMode::CShared,
+        BuildMode::CArchive,
+        BuildMode::Plugin,
+        BuildMode::Archive,
+        BuildMode::Shared,
+        BuildMode::Other("custom-future".to_string()),
+    ];
+    for mode in cases {
+        let s = mode.as_str();
+        let round = BuildMode::parse(&s);
+        assert_eq!(round, mode, "as_str → parse must round-trip for {mode:?}");
+        // Display must agree with as_str so schema serialization is stable.
+        assert_eq!(format!("{mode}"), s.as_ref());
+    }
+}
+
+#[test]
 fn build_settings_expose_buildmode_and_tags() {
     let data = load(BASIC_LINUX);
     let bin = GoBinary::parse(&data).unwrap();
     let info = bin.build_info().expect("build info present");
     assert!(info.build_mode().is_some());
     let _ = info.build_tags();
+}
+
+#[test]
+fn decode_pcln_with_files_attributes_source_file_per_line() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pcl = bin.pclntab().unwrap();
+
+    // Find a function with both pcln and pcfile entries.
+    let mut joined_total = 0usize;
+    let mut at_least_one_function = false;
+    for (_, off) in pcl.func_entries() {
+        let f = match pcl.parse_func(off) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        // Reference data: per-PC pcln + the latest-≤-pc pcfile resolution.
+        let pcfile: Vec<(u32, u32)> = pcl.decode_pcfile(&f).collect();
+        if pcfile.is_empty() {
+            continue;
+        }
+        at_least_one_function = true;
+
+        // Joined iterator must agree with the manual lockstep walk on every
+        // emitted (pc, line, path) tuple.
+        for (pc, line, path) in pcl.decode_pcln_with_files(&f) {
+            joined_total += 1;
+
+            // Expected file index = latest pcfile transition with t_pc ≤ pc.
+            let expected_idx = pcfile
+                .iter()
+                .rev()
+                .find(|(t_pc, _)| *t_pc <= pc)
+                .map(|(_, idx)| *idx)
+                .unwrap();
+            let expected_path = pcl.resolve_file_via_cu(f.cu_offset, expected_idx).unwrap();
+            assert_eq!(path, expected_path, "joined path mismatch at pc={pc}");
+
+            // Line must be a sane source line (not absurdly large).
+            assert!((0..1_000_000).contains(&line), "implausible line {line}");
+
+            if joined_total > 50 {
+                break;
+            }
+        }
+        if joined_total > 50 {
+            break;
+        }
+    }
+    assert!(at_least_one_function, "expected pcfile entries somewhere");
+    assert!(joined_total > 0, "joined iterator yielded nothing");
 }
 
 #[test]
@@ -1165,15 +1641,14 @@ fn interface_methods_resolved_when_present() {
             method_count,
             methods,
         } = &t.detail
+            && *method_count > 0
         {
-            if *method_count > 0 {
-                assert!(
-                    !methods.is_empty(),
-                    "interface {} has method_count={} but no resolved methods",
-                    t.name,
-                    method_count,
-                );
-            }
+            assert!(
+                !methods.is_empty(),
+                "interface {} has method_count={} but no resolved methods",
+                t.name,
+                method_count,
+            );
         }
     }
 }

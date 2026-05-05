@@ -5,6 +5,141 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1]
+
+Full WebAssembly container support, a broad set of public-API ergonomics
+upgrades, and a redesigned pclntab caching model that does not leak memory.
+
+### Added
+
+WebAssembly support — `GOOS=js GOARCH=wasm` (and the newer `wasip1` Go 1.21+
+target) now parses end-to-end with the same surface as ELF / Mach-O / PE:
+
+- New `BinaryFormat::Wasm` variant; `\0asm` magic detection in
+  `detect_format`.
+- New `structures::wasm` module exposes a minimal section walker, a Data
+  section segment decoder (`data_segments`), and a linear-memory image
+  reconstructor (`build_linear_memory_image`). Several Go runtime
+  structures (pcHeader, moduledata, type descriptors) span multiple
+  disjoint segments in linear memory; the reconstructed image lets the
+  same parsers that handle native formats address them by VA.
+- pclntab parsing, function enumeration, type extraction, string scanning,
+  inline-tree walking, and moduledata discovery all work on wasm. The
+  Go-emitted `go:buildid` custom section is recognized; build ID and Go
+  version extraction succeed. Test sample committed at
+  `tests/samples/basic_wasm.wasm`.
+- Adversarial wasm with absurd linear-memory offsets is gated behind a
+  256 MiB sanity cap on the reconstructed image.
+
+New accessors and ergonomics helpers:
+
+- `bin.entry_va(func)` / `bin.entry_rva(func)` — fold
+  `text_va + entry_off` (and the PE-only `image_base` subtraction) into
+  one accessor so downstream disassemblers do not have to reimplement it.
+  `BinaryContext::image_base()` exposed in support.
+- `bin.arch()` — format-disambiguated architecture accessor that resolves
+  the `(minLC=1, ptrSize=8)` ambiguity between `Arch::X86_64` and
+  `Arch::Wasm` using the container format, and falls back to build-info
+  `GOARCH` when no pclntab is present.
+- `Display` and stable `as_str` on every public enum that downstreams
+  persist: `Confidence`, `PclntabVersion`, `Arch`, plus `kind_str` on
+  `TypeDetail` and `ObfuscationKind`. Stability contract documented
+  on each type.
+- `BuildMode::as_str() -> Cow<'static, str>` + `Display`, round-tripping
+  through `BuildMode::parse`.
+- `ParsedPclntab::decode_pcln_with_files(func)` — joined iterator yielding
+  `(pc, line, file_path)` per source-line transition with the active file
+  pre-attached, replacing the "walk pcln and pcfile in lockstep" loop
+  callers otherwise reinvent.
+- Direct `TypeDetail` accessors: `array_len`, `chan_dir`, `func_arity`,
+  `struct_field_count`, `interface_method_count`.
+- Stdlib / runtime classification on `GoType` (`is_runtime`, `is_internal`,
+  `is_stdlib`) plus shared free helpers `is_runtime_path` /
+  `is_internal_path` / `is_stdlib_path` so type-side and function-side
+  classifications agree on one canonical rule.
+- `FuncData::args_size() -> u32` — typed view of the raw signed `args`
+  field (negative readings collapse to `0`).
+- `GoString::as_bytes()` and `try_as_str() -> Result<&str, Utf8Error>`.
+  The string scanner no longer silently drops non-UTF-8 length-prefixed
+  payloads (common in malware rodata).
+
+Address-space + caching internals:
+
+- `BinaryContext::structure_search_data()` returns the wasm linear-memory
+  image for wasm and the file bytes otherwise; `BinaryContext::va_to_file`
+  produces offsets into this view for every format.
+- `BinaryContext::slice_at_va(va)` — borrow a slice starting at the byte
+  at virtual address `va`; spans wasm data-segment boundaries seamlessly.
+- `PclntabMeta` — scalar metadata of a `ParsedPclntab` without the
+  borrowed `data`. Cache it; rehydrate via `PclntabMeta::attach(data)`.
+  `ParsedPclntab::meta()` extracts it.
+- `ParsedPclntab` is now `Copy` (every field already was).
+
+### Changed
+
+`GoBinary` no longer caches a `ParsedPclntab` borrowing from the input.
+Instead it caches the scalar `PclntabMeta` and rebuilds the borrowing
+struct against `&self.ctx.structure_search_data()` per call. This is what
+allows wasm support without a `Box::leak` — the wasm linear-memory image
+is owned by `BinaryContext` and borrows handed out to callers tie to
+`&self`.
+
+- `GoBinary::pclntab(&self) -> Option<ParsedPclntab<'_>>` — was
+  `Option<&ParsedPclntab<'a>>` (breaking). Method calls and
+  `let Some(pcl) = ...` patterns are unchanged; sites that explicitly
+  named the reference type must drop the `&`.
+- `FunctionIter::new(pcl: Option<ParsedPclntab<'a>>)` — takes the struct
+  by value (it's `Copy`) instead of by reference. The iterator is no
+  longer parameterized on the pcl-borrow lifetime: `FunctionIter<'a>`
+  (was `FunctionIter<'p, 'a>`).
+- `TypeIter`, `ItabIter`, `GoStringIter`, `InlineTreeIter` — lost their
+  `'ctx` / `'pcl` lifetime parameter; yielded items borrow from
+  `&BinaryContext` (was the input lifetime). Callers that collect into a
+  `Vec` keep working as long as they hold the `GoBinary`.
+- `pclntab::parse(ctx)` now takes `&'a BinaryContext<'a>` — required so
+  the returned struct can borrow from either the input bytes or the wasm
+  linear-memory image with one lifetime.
+- Stability-policy sections lifted to type-level rustdoc on `Confidence`,
+  `BuildMode`, `ObfuscationKind`, `Arch`, `PclntabVersion`, `TypeDetail`:
+  variants append-only, `Display` strings frozen, `Debug` not a stability
+  surface.
+- `bin.strings()` no longer pre-filters UTF-8. Use `GoString::try_as_str` /
+  `as_str` for text or `as_bytes` for raw rodata.
+- `ParsedPclntab::arch()` rustdoc clarified: `(1, 8)` always returns
+  `Arch::X86_64`; use `GoBinary::arch()` for format-aware disambiguation.
+- `text_va()` rustdoc no longer publishes a manual translation recipe —
+  it points to the new `entry_va` / `entry_rva` instead.
+- Lints moved from a `#![deny(...)]` attribute on `lib.rs` to a `[lints]`
+  table in `Cargo.toml`, so they enforce on every consuming workspace
+  build (not just standalone). Tests, examples, and the integration test
+  binary explicitly `#![allow(...)]` the test-friendly subset.
+- `InlineEntry::depth` rustdoc documents the realistic upper bound (real
+  Go inline chains are < 5 deep; the walker caps at 32). Type stays `u32`
+  for forward compatibility.
+
+### Fixed
+
+- Wasm binaries now report `Arch::Wasm` from `GoBinary::arch()`
+  (previously misreported as `X86_64`, a side-effect of the
+  `(minLC=1, ptrSize=8)` ambiguity).
+- `examples/dump.rs`: `--explain` argv handling no longer panics if
+  `argv[0]` is missing; SDK-file path arithmetic uses checked offsets.
+- Workspace lint enforcement caught a handful of pre-existing lint
+  violations in `examples/dump.rs` (indexing and arithmetic on
+  input-derived values), now fixed.
+
+### Documentation
+
+- `BinaryFormat::Wasm` rustdoc explains why wasm gets a reconstructed
+  linear-memory image, why `image_base = 0`, and why `text_va`/`etext_va`
+  are PC values rather than file offsets.
+- `BinaryContext` accessor block reordered (basic accessors → translation
+  → address-space helpers → format-specific) with the wasm-aware members
+  documented inline.
+- Top-level `## Supported Formats` table now includes Wasm.
+- All inline `crate::...` paths in code (not docs) hoisted to `use`
+  statements at the top of their files.
+
 ## [0.2.0]
 
 A large feature pass plus internal hardening for use in malware analysis
@@ -213,5 +348,6 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
+[0.2.1]: https://github.com/BinFlip/gobin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/BinFlip/gobin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BinFlip/gobin/releases/tag/v0.1.0

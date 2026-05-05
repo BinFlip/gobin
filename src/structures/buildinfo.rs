@@ -321,15 +321,13 @@ pub fn find_version_string(data: &[u8]) -> Option<&str> {
                 break;
             }
         }
-        if let Some(slice) = data.get(start..end) {
-            if let Ok(s) = std::str::from_utf8(slice) {
-                if s.len() >= 5
-                    && s.get(4..)
-                        .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
-                {
-                    return Some(s);
-                }
-            }
+        if let Some(slice) = data.get(start..end)
+            && let Ok(s) = std::str::from_utf8(slice)
+            && s.len() >= 5
+            && s.get(4..)
+                .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Some(s);
         }
         pos = scan_start;
     }

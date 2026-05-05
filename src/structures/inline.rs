@@ -75,6 +75,16 @@ pub struct InlineEntry<'a> {
     pub func_id: u8,
     /// Inlining depth: 0 for the outermost inlined frame at this PC, +1 per
     /// additional level toward the leaf.
+    ///
+    /// # Bounds
+    ///
+    /// Real-world Go inline chains are very shallow — typically `< 5` — and
+    /// the gobin walker caps depth at `32` to keep its cycle-detection
+    /// scratch buffer fixed-size. In practice this field will always fit in
+    /// a `u8`; consumers that store it in a narrower integer (e.g. visus
+    /// pinning it to `u8` for compact rows) can safely clamp without losing
+    /// information. The type stays `u32` to give breathing room if a future
+    /// Go runtime change increases the bound.
     pub depth: u32,
 }
 
@@ -84,8 +94,8 @@ pub struct InlineEntry<'a> {
 /// is active, in the order they appear in the function's
 /// `pcdata[PCDATA_InlTreeIndex]` table. PC ranges with index `< 0`
 /// (no inlining) are skipped.
-pub struct InlineTreeIter<'pcl, 'a> {
-    pclntab: Option<&'pcl ParsedPclntab<'a>>,
+pub struct InlineTreeIter<'a> {
+    pclntab: Option<ParsedPclntab<'a>>,
     /// Decoded `(pc, index)` pairs from `pcdata[PCDATA_InlTreeIndex]`.
     /// Cached eagerly because depth computation needs random-access lookup
     /// of parent PCs against this same table.
@@ -98,7 +108,7 @@ pub struct InlineTreeIter<'pcl, 'a> {
     blob: &'a [u8],
 }
 
-impl<'pcl, 'a> InlineTreeIter<'pcl, 'a> {
+impl<'a> InlineTreeIter<'a> {
     /// Construct an iterator that yields nothing — used when prerequisites
     /// (pclntab, moduledata, funcdata blob) are missing.
     pub fn empty() -> Self {
@@ -185,7 +195,7 @@ impl<'pcl, 'a> InlineTreeIter<'pcl, 'a> {
     }
 }
 
-impl<'a> Iterator for InlineTreeIter<'_, 'a> {
+impl<'a> Iterator for InlineTreeIter<'a> {
     type Item = InlineEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -234,12 +244,12 @@ struct InlinedCall {
 /// - The function has no `funcdata[FUNCDATA_InlTree]` entry (no inlining).
 /// - `moduledata.gofunc` is unavailable (Go 1.16-1.19, V2 binaries).
 /// - The blob can't be located via `va_to_file`.
-pub fn extract_iter<'pcl, 'a>(
-    ctx: &BinaryContext<'a>,
-    pclntab: &'pcl ParsedPclntab<'a>,
+pub fn extract_iter<'a>(
+    ctx: &'a BinaryContext<'_>,
+    pclntab: ParsedPclntab<'a>,
     moduledata: Option<&Moduledata>,
     func: &FuncData,
-) -> InlineTreeIter<'pcl, 'a> {
+) -> InlineTreeIter<'a> {
     let md = match moduledata {
         Some(m) => m,
         None => return InlineTreeIter::empty(),
@@ -258,11 +268,10 @@ pub fn extract_iter<'pcl, 'a>(
         Some(v) => v,
         None => return InlineTreeIter::empty(),
     };
-    let blob_file_off = match ctx.va_to_file(blob_va) {
-        Some(o) => o,
+    let blob = match ctx.slice_at_va(blob_va) {
+        Some(s) => s,
         None => return InlineTreeIter::empty(),
     };
-    let blob = ctx.data().get(blob_file_off..).unwrap_or(&[]);
 
     // Find which pcdata index corresponds to PCDATA_InlTreeIndex (always 2).
     let pcdata_off = match pclntab.pcdata_at(func, PCDATA_INL_TREE_INDEX) {

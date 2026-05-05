@@ -49,15 +49,15 @@ pub struct ItabPair {
 /// (either the `.itablink` section or `moduledata.itablinks`), dereferences
 /// it through VA→file translation, and parses the [`ItabPair`]. Skips entries
 /// that fail to dereference / parse — adversarial input cannot panic the walk.
-pub struct ItabIter<'ctx, 'a> {
-    ctx: &'ctx BinaryContext<'a>,
+pub struct ItabIter<'a> {
+    ctx: &'a BinaryContext<'a>,
     ps: usize,
     array: &'a [u8],
     pos: usize,
 }
 
-impl<'ctx, 'a> ItabIter<'ctx, 'a> {
-    fn empty(ctx: &'ctx BinaryContext<'a>) -> Self {
+impl<'a> ItabIter<'a> {
+    fn empty(ctx: &'a BinaryContext<'a>) -> Self {
         Self {
             ctx,
             ps: 0,
@@ -67,7 +67,7 @@ impl<'ctx, 'a> ItabIter<'ctx, 'a> {
     }
 }
 
-impl Iterator for ItabIter<'_, '_> {
+impl Iterator for ItabIter<'_> {
     type Item = ItabPair;
 
     fn next(&mut self) -> Option<ItabPair> {
@@ -113,44 +113,39 @@ impl Iterator for ItabIter<'_, '_> {
 /// 1. `.itablink` / `__itablink` section (ELF / Mach-O).
 /// 2. `moduledata.itablinks` slice (PE / older Go).
 /// 3. Empty iterator otherwise.
-pub fn extract_iter<'ctx, 'a>(
-    ctx: &'ctx BinaryContext<'a>,
+pub fn extract_iter<'a>(
+    ctx: &'a BinaryContext<'a>,
     ptr_size: u8,
     moduledata_itablinks: Option<&GoSlice>,
-) -> ItabIter<'ctx, 'a> {
+) -> ItabIter<'a> {
     let ps = ptr_size as usize;
     if ps == 0 {
         return ItabIter::empty(ctx);
     }
     let sections = ctx.sections();
 
-    if let Some(ref range) = sections.itablink {
-        if let Some(bytes) = ctx.section_data(range) {
-            return ItabIter {
-                ctx,
-                ps,
-                array: bytes,
-                pos: 0,
-            };
-        }
+    if let Some(ref range) = sections.itablink
+        && let Some(bytes) = ctx.section_data(range)
+    {
+        return ItabIter {
+            ctx,
+            ps,
+            array: bytes,
+            pos: 0,
+        };
     }
 
-    if let Some(slice) = moduledata_itablinks {
-        let data = ctx.data();
-        if let Some(file_off) = ctx.va_to_file(slice.ptr) {
-            if let Some(byte_len) = (slice.len as usize).checked_mul(ps) {
-                if let Some(end) = file_off.checked_add(byte_len) {
-                    if let Some(s) = data.get(file_off..end) {
-                        return ItabIter {
-                            ctx,
-                            ps,
-                            array: s,
-                            pos: 0,
-                        };
-                    }
-                }
-            }
-        }
+    if let Some(slice) = moduledata_itablinks
+        && let Some(rest) = ctx.slice_at_va(slice.ptr)
+        && let Some(byte_len) = (slice.len as usize).checked_mul(ps)
+        && let Some(s) = rest.get(..byte_len)
+    {
+        return ItabIter {
+            ctx,
+            ps,
+            array: s,
+            pos: 0,
+        };
     }
 
     ItabIter::empty(ctx)
@@ -158,11 +153,9 @@ pub fn extract_iter<'ctx, 'a>(
 
 /// Parse a single `itab` at `itab_va`.
 fn parse_itab(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> Option<ItabPair> {
-    let file_off = ctx.va_to_file(itab_va)?;
-    let data = ctx.data();
+    let buf = ctx.slice_at_va(itab_va)?;
     let hash_off = ps.checked_mul(2)?;
     let needed = hash_off.checked_add(4)?;
-    let buf = data.get(file_off..)?;
     if buf.len() < needed {
         return None;
     }

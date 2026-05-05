@@ -46,6 +46,7 @@ pub mod structtype;
 pub mod types;
 pub mod uncommon;
 pub(crate) mod util;
+pub mod wasm;
 
 /// Target architecture, inferred from the pclntab header's `minLC` and `ptrSize` fields.
 ///
@@ -72,6 +73,17 @@ pub(crate) mod util;
 /// Use build info's `GOARCH` setting for disambiguation.
 ///
 /// Source: `src/internal/abi/symtab.go` (PCQuantum), `src/cmd/internal/obj/link.go`
+///
+/// # Stability
+///
+/// Consumers persist this enum into long-lived schemas (database columns,
+/// structured logs). The contract:
+///
+/// - **Variants** — append-only. New architectures appear as new variants;
+///   existing variants are never renamed or removed.
+/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+///   shipped, matching the canonical `GOARCH` values where applicable.
+/// - **`Debug` strings** — *not* a stability surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     /// x86 32-bit (`minLC=1, ptrSize=4`)
@@ -118,6 +130,17 @@ pub enum Arch {
 /// Source: `src/internal/abi/symtab.go:14-34`
 ///
 /// Design doc: `golang.org/s/go12symtab` (referenced at `src/runtime/runtime2.go:1071`)
+///
+/// # Stability
+///
+/// Consumers persist this enum into long-lived schemas (database columns,
+/// structured logs). The contract:
+///
+/// - **Variants** — append-only. New format versions appear as new variants;
+///   existing variants are never renamed or removed.
+/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+///   shipped.
+/// - **`Debug` strings** — *not* a stability surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PclntabVersion {
     /// Go 1.2 through 1.15 (magic `0xFFFFFFFB`).
@@ -165,5 +188,52 @@ impl PclntabVersion {
             Self::Go118 => "Go 1.18 - 1.19",
             Self::Go120 => "Go 1.20+",
         }
+    }
+
+    /// Stable identifier for this pclntab format version
+    /// (`"go12"` / `"go116"` / `"go118"` / `"go120"`). See the `# Stability`
+    /// section on [`PclntabVersion`] for the durability contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Go12 => "go12",
+            Self::Go116 => "go116",
+            Self::Go118 => "go118",
+            Self::Go120 => "go120",
+        }
+    }
+}
+
+impl std::fmt::Display for PclntabVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Arch {
+    /// Stable lowercase identifier for this architecture, matching the
+    /// canonical `GOARCH` values where applicable
+    /// (`"386"`, `"amd64"`, `"arm"`, `"arm64"`, `"mips"`, `"mips64"`,
+    /// `"ppc64"`, `"riscv"`, `"s390x"`, `"wasm"`, `"unknown"`). See the
+    /// `# Stability` section on [`Arch`] for the durability contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86 => "386",
+            Self::X86_64 => "amd64",
+            Self::Arm => "arm",
+            Self::Arm64 => "arm64",
+            Self::Mips32 => "mips",
+            Self::Mips64 => "mips64",
+            Self::Ppc64 => "ppc64",
+            Self::RiscV => "riscv",
+            Self::S390x => "s390x",
+            Self::Wasm => "wasm",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Arch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }

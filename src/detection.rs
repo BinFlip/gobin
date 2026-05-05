@@ -23,6 +23,8 @@
 //! | `Medium` | Build info or version string found                          |
 //! | `High`   | Structural proof: pclntab magic, section names, or build ID |
 
+use crate::structures::PclntabVersion;
+
 /// Confidence level for Go binary identification.
 ///
 /// Ordered from lowest to highest, so you can use comparison operators:
@@ -30,6 +32,18 @@
 /// # use gobin::detection::Confidence;
 /// assert!(Confidence::Low < Confidence::High);
 /// ```
+///
+/// # Stability
+///
+/// Consumers persist this enum into long-lived schemas (database columns,
+/// structured logs). The contract:
+///
+/// - **Variants** — append-only. New tiers appear as new variants; existing
+///   variants are never renamed or removed.
+/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+///   shipped. Treat them as serialization keys.
+/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+///   `as_str` for anything that lands in a database column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
     /// No Go-specific indicators were found.
@@ -43,6 +57,28 @@ pub enum Confidence {
     /// Definitive structural markers confirmed: pclntab magic bytes, Go-specific
     /// section names (`.gopclntab`, `.go.buildinfo`), or ELF build ID notes.
     High,
+}
+
+impl Confidence {
+    /// Stable lowercase identifier for this confidence tier
+    /// (`"none"` / `"low"` / `"medium"` / `"high"`).
+    ///
+    /// See the `# Stability` section on [`Confidence`] for the durability
+    /// contract these strings carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Structured detection report produced during [`crate::GoBinary::parse`] /
@@ -107,7 +143,7 @@ pub enum ConfidenceSignal {
     /// pclntab was successfully parsed; carries the format version and function count.
     PclntabParsed {
         /// Detected pclntab format version.
-        version: crate::structures::PclntabVersion,
+        version: PclntabVersion,
         /// Number of functions decoded from the pclntab.
         nfunc: usize,
     },

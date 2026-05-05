@@ -91,7 +91,7 @@
 //! Source: `src/runtime/symtab.go:579-582`
 
 use crate::{
-    formats::{BinaryContext, GoSections},
+    formats::{BinaryContext, BinaryFormat, GoSections},
     structures::{
         Arch, PclntabVersion,
         util::{advance_n, read_uintptr, read_uvarint, slice_at},
@@ -111,12 +111,23 @@ const MAGICS: &[([u8; 4], PclntabVersion)] = &[
 /// A parsed pclntab header with accessors into function and file name tables.
 ///
 /// All offsets are relative to the start of the pclntab section (`self.data[0]`
-/// = the `pcHeader` magic bytes). The lifetime `'a` borrows from the original
-/// binary data, enabling zero-copy string access.
+/// = the `pcHeader` magic bytes). The lifetime `'a` borrows from the address
+/// space the parser ran on:
+///
+/// - For ELF / Mach-O / PE this is the input file bytes — zero-copy access.
+/// - For Wasm this is the reconstructed linear-memory image owned by
+///   [`crate::formats::BinaryContext`]; in that case the borrow lives only as
+///   long as the `&BinaryContext` it was derived from. Cache the scalar
+///   metadata via [`Self::meta`] if you need to re-attach later.
+///
+/// Cheap to copy — every field is `Copy` (`&'a [u8]` and integers).
+#[derive(Debug, Clone, Copy)]
 pub struct ParsedPclntab<'a> {
     /// The entire pclntab section data, starting at the pcHeader.
     pub data: &'a [u8],
-    /// Absolute file offset where this pclntab starts in the binary.
+    /// Absolute offset where this pclntab starts inside [`Self::data`]. For
+    /// ELF/Mach-O/PE this is a file offset; for wasm a linear-memory offset
+    /// (since `data` is the reconstructed linear-memory image).
     pub offset: usize,
     /// Detected pclntab version (determines struct layouts).
     pub version: PclntabVersion,
@@ -141,10 +152,99 @@ pub struct ParsedPclntab<'a> {
     pub functab_offset: usize,
 }
 
+/// Scalar metadata of a [`ParsedPclntab`] without the borrowed `data`.
+///
+/// Useful for callers that want to keep pclntab state across method calls
+/// without holding a long-lived borrow of [`crate::formats::BinaryContext`].
+/// Pair with [`ParsedPclntab::meta`] to extract; pair with
+/// [`PclntabMeta::attach`] to rehydrate on demand against a fresh
+/// `&BinaryContext`.
+#[derive(Debug, Clone, Copy)]
+pub struct PclntabMeta {
+    /// See [`ParsedPclntab::offset`].
+    pub offset: usize,
+    /// See [`ParsedPclntab::version`].
+    pub version: PclntabVersion,
+    /// See [`ParsedPclntab::min_lc`].
+    pub min_lc: u8,
+    /// See [`ParsedPclntab::ptr_size`].
+    pub ptr_size: u8,
+    /// See [`ParsedPclntab::nfunc`].
+    pub nfunc: usize,
+    /// See [`ParsedPclntab::nfiles`].
+    pub nfiles: usize,
+    /// See [`ParsedPclntab::funcname_offset`].
+    pub funcname_offset: usize,
+    /// See [`ParsedPclntab::cu_offset`].
+    pub cu_offset: usize,
+    /// See [`ParsedPclntab::filetab_offset`].
+    pub filetab_offset: usize,
+    /// See [`ParsedPclntab::pctab_offset`].
+    pub pctab_offset: usize,
+    /// See [`ParsedPclntab::functab_offset`].
+    pub functab_offset: usize,
+}
+
+impl PclntabMeta {
+    /// Re-attach this metadata to the address-space buffer, reconstructing a
+    /// borrowing [`ParsedPclntab`] whose `data` field starts at the pcHeader.
+    ///
+    /// `address_data` is the full address-space view the metadata was
+    /// originally derived from (for ELF/Mach-O/PE, the input file bytes; for
+    /// wasm, the reconstructed linear-memory image — typically obtained via
+    /// [`crate::formats::BinaryContext::structure_search_data`]). This
+    /// helper slices it at [`Self::offset`] so the returned struct's
+    /// `data[0]` is the pcHeader's first byte, matching the layout
+    /// `pclntab::parse` produces.
+    ///
+    /// Returns `None` if `address_data` does not cover `self.offset` —
+    /// would only happen if the buffer the metadata came from is not the one
+    /// passed in.
+    pub fn attach<'a>(&self, address_data: &'a [u8]) -> Option<ParsedPclntab<'a>> {
+        let data = address_data.get(self.offset..)?;
+        Some(ParsedPclntab {
+            data,
+            offset: self.offset,
+            version: self.version,
+            min_lc: self.min_lc,
+            ptr_size: self.ptr_size,
+            nfunc: self.nfunc,
+            nfiles: self.nfiles,
+            funcname_offset: self.funcname_offset,
+            cu_offset: self.cu_offset,
+            filetab_offset: self.filetab_offset,
+            pctab_offset: self.pctab_offset,
+            functab_offset: self.functab_offset,
+        })
+    }
+}
+
 impl<'a> ParsedPclntab<'a> {
+    /// Extract the scalar metadata, dropping the borrow of [`Self::data`].
+    /// See [`PclntabMeta`] for the round-trip story.
+    pub fn meta(&self) -> PclntabMeta {
+        PclntabMeta {
+            offset: self.offset,
+            version: self.version,
+            min_lc: self.min_lc,
+            ptr_size: self.ptr_size,
+            nfunc: self.nfunc,
+            nfiles: self.nfiles,
+            funcname_offset: self.funcname_offset,
+            cu_offset: self.cu_offset,
+            filetab_offset: self.filetab_offset,
+            pctab_offset: self.pctab_offset,
+            functab_offset: self.functab_offset,
+        }
+    }
+
     /// Infer the target architecture from `minLC` and `ptrSize`.
     ///
-    /// See [`Arch`] for the mapping table and caveats.
+    /// See [`Arch`] for the mapping table and caveats. Several
+    /// `(minLC, ptrSize)` combinations are ambiguous; in particular
+    /// `(1, 8)` matches both `Arch::X86_64` and `Arch::Wasm`. This accessor
+    /// always reports `Arch::X86_64` for that combination — use
+    /// [`crate::GoBinary::arch`] for the format-disambiguated result.
     pub fn arch(&self) -> Arch {
         match (self.min_lc, self.ptr_size) {
             (1, 4) => Arch::X86,
@@ -313,6 +413,30 @@ impl<'a> ParsedPclntab<'a> {
         }
     }
 
+    /// Joined PC-to-line-and-file iterator yielding
+    /// `(pc_offset, line, file_path)`.
+    ///
+    /// The pclntab encodes line numbers and file numbers as two independent
+    /// run-length tables: pcfile only emits a transition when the *file*
+    /// changes, while pcln emits one per line transition. To attribute a
+    /// source file to each line event, callers otherwise have to pre-collect
+    /// pcfile and run their own "latest pcfile entry ≤ pc" lookup. This
+    /// helper folds that bookkeeping in.
+    ///
+    /// pcfile entries whose index doesn't resolve through the cutab are
+    /// skipped (consistent with [`Self::decode_pcfile_paths`]). pcln events
+    /// before the first pcfile transition are also skipped — they would
+    /// have no file to attribute to.
+    pub fn decode_pcln_with_files<'pcl>(&'pcl self, func: &FuncData) -> PcLineFileIter<'pcl, 'a> {
+        PcLineFileIter {
+            inner: self.decode_pcln(func),
+            pcfile: self.decode_pcfile(func).collect(),
+            cursor: None,
+            pcl: self,
+            cu_offset: func.cu_offset,
+        }
+    }
+
     /// Resolve the source file for a function via its pcfile and cutab entries.
     ///
     /// Returns the file name for the first (entry-point) file index. Wraps
@@ -428,12 +552,11 @@ impl<'a> Iterator for FileNameIter<'a> {
             let end = rest.iter().position(|&b| b == 0)?;
             self.remaining = self.remaining.checked_sub(1)?;
             self.pos = self.pos.checked_add(end)?.checked_add(1)?;
-            if end > 0 {
-                if let Some(name_bytes) = rest.get(..end) {
-                    if let Ok(name) = std::str::from_utf8(name_bytes) {
-                        return Some(name);
-                    }
-                }
+            if end > 0
+                && let Some(name_bytes) = rest.get(..end)
+                && let Ok(name) = std::str::from_utf8(name_bytes)
+            {
+                return Some(name);
             }
         }
         None
@@ -568,6 +691,70 @@ impl<'a> Iterator for PcFilePathIter<'_, 'a> {
     }
 }
 
+/// Streaming PC-to-line iterator with the active source file pre-joined.
+///
+/// Yields `(pc_offset, line, file_path)`. The file table only emits a
+/// transition when the active source file *changes*, so the joined iterator
+/// carries the latest transition forward across `pcln` events. Entries whose
+/// file index doesn't resolve through the cutab are skipped silently — same
+/// rule as [`PcFilePathIter`].
+///
+/// This replaces the hand-rolled "walk pcfile and pcln in lockstep" state
+/// machine that every consumer otherwise reinvents.
+pub struct PcLineFileIter<'pcl, 'a> {
+    inner: PcLineIter<'a>,
+    /// Pre-collected `(pc_offset, file_index)` transitions, in PC order.
+    pcfile: Vec<(u32, u32)>,
+    /// Index into `pcfile` of the most recent transition whose pc ≤ current.
+    /// Starts as `None` until at least one event has been observed.
+    cursor: Option<usize>,
+    pcl: &'pcl ParsedPclntab<'a>,
+    cu_offset: u32,
+}
+
+impl<'a> Iterator for PcLineFileIter<'_, 'a> {
+    type Item = (u32, i32, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (pc, line) = self.inner.next()?;
+
+            // Advance the pcfile cursor to the latest transition with pc ≤ current.
+            // pcfile transitions are emitted in monotonically increasing PC order,
+            // and we walk pcln in the same order — so the cursor only ever moves
+            // forward.
+            let mut next_idx = match self.cursor {
+                Some(c) => c.saturating_add(1),
+                None => 0,
+            };
+            while let Some(&(t_pc, _)) = self.pcfile.get(next_idx) {
+                if t_pc > pc {
+                    break;
+                }
+                self.cursor = Some(next_idx);
+                next_idx = match next_idx.checked_add(1) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+
+            let cursor = match self.cursor {
+                Some(c) => c,
+                // No pcfile transition yet ≤ current pc — try the next pcln event.
+                None => continue,
+            };
+            let (_, file_idx) = match self.pcfile.get(cursor) {
+                Some(t) => *t,
+                None => continue,
+            };
+            match self.pcl.resolve_file_via_cu(self.cu_offset, file_idx) {
+                Some(path) => return Some((pc, line, path)),
+                None => continue,
+            }
+        }
+    }
+}
+
 /// Parsed `_func` structure fields (per-function metadata).
 ///
 /// See the module-level documentation for the full struct layout.
@@ -599,14 +786,10 @@ pub struct FuncData {
     pub func_off: u32,
     /// PC offset from `moduledata.text` (the start of executable code).
     ///
-    /// This is **not** a `goblin`-derived RVA. To translate to a binary-level
-    /// VA or RVA, add the runtime address of `runtime.text` (exposed via
-    /// [`crate::GoBinary::text_va`]):
-    ///
-    /// ```text
-    /// va  = bin.text_va()? + func.entry_off as u64
-    /// rva = va - image_base   // for image-base-relative formats (PE)
-    /// ```
+    /// This is **not** a `goblin`-derived RVA. Use
+    /// [`crate::GoBinary::entry_va`] or [`crate::GoBinary::entry_rva`] to
+    /// translate to a disassembler-friendly address; both fold the
+    /// `runtime.text` lookup and the PE image-base correction into one call.
     pub entry_off: u32,
     /// Index into `funcnametab` for this function's name.
     pub name_off: i32,
@@ -634,6 +817,21 @@ pub struct FuncData {
     pub nfuncdata: u8,
 }
 
+impl FuncData {
+    /// Total argument size in bytes (input + output parameters).
+    ///
+    /// Returns the same byte count as [`Self::args`], reinterpreted as
+    /// unsigned. The Go runtime stores this as `int32` for signed-arithmetic
+    /// reasons internal to the linker, but the value is logically a
+    /// non-negative byte count: a well-formed binary never emits a negative
+    /// value here. Negative readings collapse to `0` instead of wrapping
+    /// around to a giant `u32`, so callers can treat the result as a true
+    /// byte count without further validation.
+    pub fn args_size(&self) -> u32 {
+        if self.args < 0 { 0 } else { self.args as u32 }
+    }
+}
+
 /// Parse a pclntab from binary data.
 ///
 /// Uses a layered detection strategy, from cheapest/most reliable to most expensive:
@@ -653,24 +851,33 @@ pub struct FuncData {
 /// 5. **functab monotonicity** — Scan read-only sections for long arrays of
 ///    `(u32, u32)` pairs with strictly monotonically increasing first elements.
 ///    Work backwards to find the pcHeader. (Strategy C from RESEARCH.md §1.5)
-pub fn parse<'a>(ctx: &BinaryContext<'a>) -> Option<ParsedPclntab<'a>> {
+pub fn parse<'a>(ctx: &'a BinaryContext<'a>) -> Option<ParsedPclntab<'a>> {
     let data = ctx.data();
     let sections = ctx.sections();
 
     // Strategy 0: known section + magic validation (cheapest)
-    if let Some(ref range) = sections.gopclntab {
-        if let Some(raw_end) = range.offset.checked_add(range.size) {
-            let end = raw_end.min(data.len());
-            if let Some(section_data) = data.get(range.offset..end) {
-                if let Some(parsed) = try_parse_at(section_data, range.offset) {
-                    return Some(parsed);
-                }
-            }
+    if let Some(ref range) = sections.gopclntab
+        && let Some(raw_end) = range.offset.checked_add(range.size)
+    {
+        let end = raw_end.min(data.len());
+        if let Some(section_data) = data.get(range.offset..end)
+            && let Some(parsed) = try_parse_at(section_data, range.offset)
+        {
+            return Some(parsed);
         }
     }
 
-    // Strategy 1: full-binary magic scan
-    if let Some(parsed) = scan_for_magic(data) {
+    // Strategy 1: full-binary magic scan. ELF/Mach-O/PE place the pcHeader
+    // at a 4-byte-aligned file offset. Wasm fragments the pclntab across
+    // many data segments separated by zero-fill gaps, so we scan the
+    // reconstructed *linear-memory image* for it (offsets in the pcHeader
+    // are relative to its linear-memory address, not its file offset).
+    let (search_data, stride) = if ctx.format() == BinaryFormat::Wasm {
+        (ctx.structure_search_data(), 1usize)
+    } else {
+        (data, 4usize)
+    };
+    if let Some(parsed) = scan_for_magic_strided(search_data, stride) {
         return Some(parsed);
     }
 
@@ -704,19 +911,22 @@ fn try_parse_at(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
     parse_header(data, base_offset, version)
 }
 
-/// Scan the binary for pclntab magic bytes at 4-byte aligned offsets.
-fn scan_for_magic(data: &[u8]) -> Option<ParsedPclntab<'_>> {
-    for offset in (0..data.len().saturating_sub(72)).step_by(4) {
+/// Scan the binary for pclntab magic bytes at `stride`-byte offsets.
+///
+/// `stride = 4` covers ELF/Mach-O/PE where the pcHeader is 4-byte-aligned in
+/// the file. `stride = 1` is needed for Wasm, where the Data-section payload
+/// sits at an arbitrary file offset.
+fn scan_for_magic_strided(data: &[u8], stride: usize) -> Option<ParsedPclntab<'_>> {
+    for offset in (0..data.len().saturating_sub(72)).step_by(stride) {
         let magic = match slice_at::<4>(data, offset) {
             Some(m) => m,
             None => continue,
         };
-        if MAGICS.iter().any(|(m, _)| *m == magic) {
-            if let Some(rest) = data.get(offset..) {
-                if let Some(parsed) = try_parse_at(rest, offset) {
-                    return Some(parsed);
-                }
-            }
+        if MAGICS.iter().any(|(m, _)| *m == magic)
+            && let Some(rest) = data.get(offset..)
+            && let Some(parsed) = try_parse_at(rest, offset)
+        {
+            return Some(parsed);
         }
     }
     None
@@ -776,10 +986,10 @@ fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
         // Check that some bytes after the first null look like ASCII text
         if fndata.len() > 2 {
             let scan_end = fndata.len().min(32);
-            if let Some(window) = fndata.get(1..scan_end) {
-                if !window.iter().any(|&b| b.is_ascii_alphanumeric()) {
-                    return None;
-                }
+            if let Some(window) = fndata.get(1..scan_end)
+                && !window.iter().any(|&b| b.is_ascii_alphanumeric())
+            {
+                return None;
             }
         }
     }
@@ -800,18 +1010,18 @@ fn scan_relaxed<'a>(data: &'a [u8], sections: &GoSections) -> Option<ParsedPclnt
     // Otherwise scan the whole binary at pointer-aligned offsets.
     // This is more expensive, so step by 8 (common ptrSize alignment).
     for offset in (0..data.len().saturating_sub(72)).step_by(8) {
-        if let Some(rest) = data.get(offset..) {
-            if let Some(parsed) = try_parse_relaxed(rest, offset) {
-                return Some(parsed);
-            }
+        if let Some(rest) = data.get(offset..)
+            && let Some(parsed) = try_parse_relaxed(rest, offset)
+        {
+            return Some(parsed);
         }
     }
     // Retry at 4-byte alignment for 32-bit binaries
     for offset in (4..data.len().saturating_sub(40)).step_by(8) {
-        if let Some(rest) = data.get(offset..) {
-            if let Some(parsed) = try_parse_relaxed(rest, offset) {
-                return Some(parsed);
-            }
+        if let Some(rest) = data.get(offset..)
+            && let Some(parsed) = try_parse_relaxed(rest, offset)
+        {
+            return Some(parsed);
         }
     }
     None
@@ -870,12 +1080,11 @@ fn scan_via_moduledata<'a>(ctx: &BinaryContext<'a>) -> Option<ParsedPclntab<'a>>
                     Some(e) => e,
                     None => continue,
                 };
-                if header_end <= data.len() {
-                    if let Some(rest) = data.get(target_file_off..) {
-                        if let Some(parsed) = try_parse_relaxed(rest, target_file_off) {
-                            return Some(parsed);
-                        }
-                    }
+                if header_end <= data.len()
+                    && let Some(rest) = data.get(target_file_off..)
+                    && let Some(parsed) = try_parse_relaxed(rest, target_file_off)
+                {
+                    return Some(parsed);
                 }
             }
         }
@@ -1066,12 +1275,10 @@ fn recover_header_from_functab<'a>(
                 && (nfunc == run_len
                     || nfunc_plus_one == Some(run_len)
                     || Some(nfunc) == run_plus_one)
+                && let Some(rest) = data.get(candidate..)
+                && let Some(parsed) = try_parse_relaxed(rest, candidate)
             {
-                if let Some(rest) = data.get(candidate..) {
-                    if let Some(parsed) = try_parse_relaxed(rest, candidate) {
-                        return Some(parsed);
-                    }
-                }
+                return Some(parsed);
             }
         }
 

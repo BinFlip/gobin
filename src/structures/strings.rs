@@ -19,7 +19,12 @@
 //! - Bounding `len` to `[MIN_LEN, MAX_LEN]` (default 2..=4096).
 //! - Excluding pointers that fall inside `[moduledata.text, moduledata.etext)`
 //!   (string data never lives in the code segment).
-//! - Validating the bytes as UTF-8.
+//!
+//! UTF-8 is **not** required: malware regularly stashes non-UTF-8 payloads
+//! (encoded shellcode, blobs, encrypted strings) in rodata as Go-style
+//! length-prefixed entries, and a UTF-8 filter would silently drop them.
+//! Consumers decide whether to interpret bytes as text via [`GoString::as_bytes`],
+//! [`GoString::try_as_str`], or the convenience [`GoString::as_str`].
 //!
 //! Duplicate yields are *not* filtered — a string referenced from N
 //! different positions yields N times. Consumers that want unique results
@@ -54,10 +59,27 @@ pub struct GoString<'a> {
 }
 
 impl<'a> GoString<'a> {
-    /// Convenience accessor: try to view the bytes as `&str`. Always succeeds
-    /// for entries yielded by [`GoStringIter`] (which validates UTF-8 before
-    /// emitting), but the conversion is repeated here for callers that
-    /// constructed `GoString` by other means.
+    /// Raw bytes of the string, borrowed from the binary.
+    ///
+    /// Always succeeds — this is the canonical view for callers that want
+    /// to handle arbitrary byte content (hex-dump, base64-encode, MinHash,
+    /// etc.). Unlike [`Self::as_str`] / [`Self::try_as_str`], no UTF-8
+    /// validation is performed.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Try to view the bytes as `&str`, returning the underlying
+    /// [`std::str::Utf8Error`] on failure.
+    ///
+    /// Use this when you need to distinguish "not valid UTF-8" from "valid
+    /// but empty"; otherwise [`Self::as_str`] is the more ergonomic choice.
+    pub fn try_as_str(&self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.bytes)
+    }
+
+    /// Convenience accessor: view the bytes as `&str`, or `None` for non-UTF-8
+    /// content. Equivalent to `self.try_as_str().ok()`.
     pub fn as_str(&self) -> Option<&'a str> {
         std::str::from_utf8(self.bytes).ok()
     }
@@ -68,8 +90,8 @@ impl<'a> GoString<'a> {
 /// Walks the binary's bytes at `ps`-aligned offsets, treating each pair of
 /// adjacent ptr-sized words as a candidate `(ptr, len)` header. Yields one
 /// [`GoString`] per validated header.
-pub struct GoStringIter<'ctx, 'a> {
-    ctx: &'ctx BinaryContext<'a>,
+pub struct GoStringIter<'a> {
+    ctx: &'a BinaryContext<'a>,
     pos: usize,
     ps: usize,
     /// `[text_start, text_end)`. Pointers into this range are skipped (string
@@ -78,8 +100,8 @@ pub struct GoStringIter<'ctx, 'a> {
     text_end: u64,
 }
 
-impl<'ctx, 'a> GoStringIter<'ctx, 'a> {
-    fn empty(ctx: &'ctx BinaryContext<'a>) -> Self {
+impl<'a> GoStringIter<'a> {
+    fn empty(ctx: &'a BinaryContext<'a>) -> Self {
         Self {
             ctx,
             pos: 0,
@@ -90,7 +112,7 @@ impl<'ctx, 'a> GoStringIter<'ctx, 'a> {
     }
 }
 
-impl<'a> Iterator for GoStringIter<'_, 'a> {
+impl<'a> Iterator for GoStringIter<'a> {
     type Item = GoString<'a>;
 
     fn next(&mut self) -> Option<GoString<'a>> {
@@ -99,7 +121,9 @@ impl<'a> Iterator for GoStringIter<'_, 'a> {
             return None;
         }
         let ps_u8 = u8::try_from(ps).ok()?;
-        let data = self.ctx.data();
+        // Walk the address space the runtime would see — for wasm the
+        // reconstructed linear-memory image, otherwise the file bytes.
+        let data = self.ctx.structure_search_data();
 
         loop {
             // Need ps + ps bytes for the (ptr, len) header.
@@ -127,17 +151,14 @@ impl<'a> Iterator for GoStringIter<'_, 'a> {
                 _ => continue,
             };
 
-            let file_off = match self.ctx.va_to_file(va) {
-                Some(o) => o,
-                None => continue,
-            };
-            let bytes = match data.get(file_off..).and_then(|s| s.get(..len)) {
+            let bytes = match self.ctx.slice_at_va(va).and_then(|s| s.get(..len)) {
                 Some(b) => b,
                 None => continue,
             };
-            if std::str::from_utf8(bytes).is_err() {
-                continue;
-            }
+            // No UTF-8 filter here — see the module-level docs. Callers that
+            // need text use `GoString::try_as_str` / `as_str`; callers that
+            // want raw rodata bytes (malware payloads, MinHash signal) use
+            // `GoString::as_bytes`.
             return Some(GoString { va, len, bytes });
         }
     }
@@ -148,11 +169,11 @@ impl<'a> Iterator for GoStringIter<'_, 'a> {
 /// Returns an empty iterator when the binary lacks VA mapping (no goblin
 /// parse succeeded) or has no recoverable moduledata to bound the text
 /// segment.
-pub fn extract_iter<'ctx, 'a>(
-    ctx: &'ctx BinaryContext<'a>,
+pub fn extract_iter<'a>(
+    ctx: &'a BinaryContext<'a>,
     moduledata: Option<&Moduledata>,
     ptr_size: u8,
-) -> GoStringIter<'ctx, 'a> {
+) -> GoStringIter<'a> {
     let ps = ptr_size as usize;
     if ps == 0 || !ctx.has_va_mapping() {
         return GoStringIter::empty(ctx);

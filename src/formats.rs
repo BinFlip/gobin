@@ -32,7 +32,10 @@
 
 use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
 
-use crate::detection::find_bytes;
+use crate::{
+    detection::find_bytes,
+    structures::wasm::{build_linear_memory_image, walk as walk_wasm_sections},
+};
 
 /// The executable format of the binary being analyzed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,31 @@ pub enum BinaryFormat {
     /// PE (Portable Executable) -- Windows.
     /// Magic: `MZ` (`4d 5a`) DOS header.
     Pe,
+    /// WebAssembly module (`.wasm`) — produced by `GOOS=js GOARCH=wasm` (or
+    /// `wasip1` since Go 1.21).
+    /// Magic: `\0asm` + version `01 00 00 00`.
+    ///
+    /// Wasm has no ELF/Mach-O/PE-style virtual-address space; instead the
+    /// runtime addresses static data via *linear-memory offsets*. Two
+    /// translations make wasm look the same as the other formats to
+    /// downstream parsers:
+    ///
+    /// - `image_base` is `0` — linear-memory addresses are absolute.
+    /// - The Data section's many segments are reassembled into one
+    ///   contiguous linear-memory image (with zero-fill gaps), and that
+    ///   image becomes the address space [`BinaryContext::va_to_file`]
+    ///   resolves through. Several Go runtime structures (the pcHeader,
+    ///   moduledata, type descriptors, …) span multiple disjoint segments
+    ///   in linear memory; the image presents them contiguously.
+    ///
+    /// The Go linker does not emit format-specific sections (`.gopclntab`
+    /// etc.) for wasm — only three custom sections: `go:buildid`,
+    /// `producers`, `name`. pclntab and buildinfo bytes live inside the
+    /// Data-section linear-memory payload alongside the rest of the
+    /// runtime's static data. `text_va` and `etext_va` here are runtime
+    /// "PC" boundaries — not byte offsets into the Code section — since
+    /// wasm encodes a Go PC as `(function_index << 16) | bytecode_offset`.
+    Wasm,
     /// Unrecognized format. Magic-byte scanning can still find Go structures.
     Unknown,
 }
@@ -101,7 +129,7 @@ pub struct SectionRange {
 pub struct BinaryContext<'a> {
     /// The raw binary data this context borrows from.
     data: &'a [u8],
-    /// Detected binary format (ELF / Mach-O / PE / Unknown).
+    /// Detected binary format (ELF / Mach-O / PE / Wasm / Unknown).
     format: BinaryFormat,
     /// Go-specific section locations.
     sections: GoSections,
@@ -112,6 +140,28 @@ pub struct BinaryContext<'a> {
     /// Empty for non-ELF binaries. Used by build ID extraction to walk
     /// note entries without re-parsing the ELF.
     elf_note_segments: Vec<(usize, usize)>,
+    /// Image base virtual address.
+    ///
+    /// For PE binaries this is the `OptionalHeader.ImageBase` field — RVAs in
+    /// the PE address space are relative to it. For ELF and Mach-O the field
+    /// is `0`, since their addresses are already absolute VAs and "RVA"
+    /// effectively coincides with VA. `Unknown` formats also report `0`.
+    image_base: u64,
+    /// Reconstructed wasm linear-memory image, when `format == Wasm`.
+    ///
+    /// Wasm splits the runtime's static data across many independently-placed
+    /// data segments separated by zero-fill gaps in linear memory. Several
+    /// Go runtime structures (the pclntab and moduledata in particular) span
+    /// multiple segments. We materialize a single linear-memory image at
+    /// parse time so downstream parsers can address bytes by their VA the
+    /// same way they do for ELF/Mach-O/PE.
+    ///
+    /// Owned by [`BinaryContext`] (no leak). Borrows handed out via
+    /// [`Self::structure_search_data`] are tied to `&self` and live as long
+    /// as the context does — all parsers that build structures borrowing
+    /// from the LM image (`ParsedPclntab`, `GoType`, etc.) borrow with the
+    /// same `&self` lifetime.
+    wasm_lm: Option<Box<[u8]>>,
 }
 
 impl<'a> BinaryContext<'a> {
@@ -134,6 +184,7 @@ impl<'a> BinaryContext<'a> {
         };
         let mut segments = Vec::new();
         let mut elf_note_segments = Vec::new();
+        let mut image_base: u64 = 0;
 
         if let Ok(obj) = goblin::Object::parse(data) {
             match obj {
@@ -195,7 +246,7 @@ impl<'a> BinaryContext<'a> {
                     }
                 }
                 goblin::Object::PE(pe) => {
-                    let image_base = pe.image_base;
+                    image_base = pe.image_base;
                     for section in &pe.sections {
                         let va = image_base.saturating_add(section.virtual_address as u64);
                         let file_off = section.pointer_to_raw_data as u64;
@@ -228,12 +279,45 @@ impl<'a> BinaryContext<'a> {
             sections.has_go_buildid_note = check_elf_go_note(data);
         }
 
+        // WASM: walk custom sections for the Go-emitted markers, register
+        // each data segment as a VA segment so `va_to_file` translates
+        // linear-memory addresses to file offsets, and reconstruct the
+        // linear-memory image so downstream parsers can address pclntab /
+        // moduledata bytes by VA.
+        let mut wasm_lm: Option<Box<[u8]>> = None;
+        if format == BinaryFormat::Wasm {
+            for sec in walk_wasm_sections(data) {
+                if sec.id == 0 && sec.name == Some("go:buildid") {
+                    // Presence is a hard signal that the Go linker produced
+                    // this binary. Reuse the existing flag — buildid extract
+                    // falls through to the raw-marker scan and finds the
+                    // payload bytes inside the section.
+                    sections.has_go_buildid_note = true;
+                }
+            }
+            // Reconstruct the linear-memory image. Cap at 256 MB so an
+            // adversarial wasm with absurd offsets can't blow our memory.
+            const MAX_LM_BYTES: usize = 256 * 1024 * 1024;
+            if let Some(image) = build_linear_memory_image(data, MAX_LM_BYTES) {
+                // Register the linear-memory image as a single VA mapping.
+                // This makes `va_to_file(va) == va`, so every code path that
+                // does `structure_search_data()[va_to_file(va)..]` reads
+                // contiguous bytes across wasm data-segment boundaries —
+                // gaps are zero-fill in the reconstructed image.
+                let lm_len = image.len() as u64;
+                segments.push((0u64, 0u64, lm_len));
+                wasm_lm = Some(image.into_boxed_slice());
+            }
+        }
+
         Self {
             data,
             format,
             sections,
             segments,
             elf_note_segments,
+            image_base,
+            wasm_lm,
         }
     }
 
@@ -250,6 +334,16 @@ impl<'a> BinaryContext<'a> {
     /// Go-specific section locations discovered during construction.
     pub fn sections(&self) -> &GoSections {
         &self.sections
+    }
+
+    /// The image base virtual address.
+    ///
+    /// For PE binaries this is `OptionalHeader.ImageBase`; subtract it from a
+    /// VA to obtain a PE-style RVA in the disassembler's address space. For
+    /// ELF and Mach-O this is `0`, since their VAs are already image-base
+    /// relative.
+    pub fn image_base(&self) -> u64 {
+        self.image_base
     }
 
     /// Whether VA-to-file-offset translation is available.
@@ -281,6 +375,41 @@ impl<'a> BinaryContext<'a> {
             }
         }
         None
+    }
+
+    /// Bytes used by the pclntab/moduledata parsers as their address space.
+    ///
+    /// For wasm this is the reconstructed linear-memory image (covering all
+    /// data segments laid out at their target offsets, with zero-fill in
+    /// between). For every other format this is the file bytes — wasm is the
+    /// only one where Go runtime structures span multiple disjoint regions.
+    ///
+    /// Offsets returned by [`Self::va_to_file`] index into this slice for
+    /// every format. The returned borrow is tied to `&self`; consumers that
+    /// need to construct longer-lived structures (e.g. caching parsed state
+    /// across method calls) should store scalar metadata and re-derive
+    /// borrowing structs on demand.
+    pub fn structure_search_data(&self) -> &[u8] {
+        match self.wasm_lm.as_deref() {
+            Some(lm) => lm,
+            None => self.data,
+        }
+    }
+
+    /// Borrow a slice starting at the byte at virtual address `va`.
+    ///
+    /// Format-aware: for wasm, indexes into the reconstructed linear-memory
+    /// image (so the slice spans wasm data-segment boundaries seamlessly).
+    /// For ELF/Mach-O/PE, equivalent to `va_to_file(va).map(|off|
+    /// data.get(off..))`.
+    ///
+    /// Used by Go-runtime structure parsers (types, moduledata, itab, inline
+    /// tree, strings) which need to read multi-byte structures starting at
+    /// a given VA without worrying about whether the bytes happen to live
+    /// in one file region or several.
+    pub fn slice_at_va(&self, va: u64) -> Option<&[u8]> {
+        let off = self.va_to_file(va)?;
+        self.structure_search_data().get(off..)
     }
 
     /// Return the raw bytes for a given [`SectionRange`], bounds-checked.
@@ -329,6 +458,15 @@ pub fn detect_format(data: &[u8]) -> BinaryFormat {
         [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] => BinaryFormat::MachO,
         [0xfe, 0xed, 0xfa, 0xcf] | [0xfe, 0xed, 0xfa, 0xce] => BinaryFormat::MachO,
         [b'M', b'Z', ..] => BinaryFormat::Pe,
+        // Wasm magic `\0asm` + version `01 00 00 00`. The full version is in
+        // the next 4 bytes; we validate it explicitly below.
+        [0x00, b'a', b's', b'm']
+            if data
+                .get(4..8)
+                .is_some_and(|v| v == [0x01, 0x00, 0x00, 0x00]) =>
+        {
+            BinaryFormat::Wasm
+        }
         _ => BinaryFormat::Unknown,
     }
 }

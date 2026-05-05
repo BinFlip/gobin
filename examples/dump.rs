@@ -23,19 +23,20 @@ use gobin::{
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
+    let prog = raw.first().map(String::as_str).unwrap_or("dump");
     let mut explain = false;
     let mut path: Option<String> = None;
     for arg in raw.iter().skip(1) {
         match arg.as_str() {
             "--explain" => explain = true,
             "-h" | "--help" => {
-                println!("Usage: {} [--explain] <go-binary>", raw[0]);
+                println!("Usage: {prog} [--explain] <go-binary>");
                 return;
             }
             other if path.is_none() => path = Some(other.to_string()),
             other => {
-                eprintln!("Unexpected argument: {}", other);
-                eprintln!("Usage: {} [--explain] <go-binary>", raw[0]);
+                eprintln!("Unexpected argument: {other}");
+                eprintln!("Usage: {prog} [--explain] <go-binary>");
                 std::process::exit(2);
             }
         }
@@ -43,7 +44,7 @@ fn main() {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("Usage: {} [--explain] <go-binary>", raw[0]);
+            eprintln!("Usage: {prog} [--explain] <go-binary>");
             std::process::exit(2);
         }
     };
@@ -51,7 +52,7 @@ fn main() {
     let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error reading {}: {}", path, e);
+            eprintln!("Error reading {path}: {e}");
             std::process::exit(1);
         }
     };
@@ -59,7 +60,7 @@ fn main() {
     let bin = match GoBinary::try_parse(&data) {
         Ok(b) => b,
         Err(ParseError::NotAGoBinary { report }) => {
-            eprintln!("{}: not a Go binary", path);
+            eprintln!("{path}: not a Go binary");
             print_report(&report);
             std::process::exit(1);
         }
@@ -101,19 +102,19 @@ fn print_report(report: &ConfidenceReport) {
             ConfidenceSignal::BuildIdMarkerFound => eprintln!("  [+] build-id raw marker found"),
             ConfidenceSignal::BuildinfoParsed => eprintln!("  [+] buildinfo blob parsed"),
             ConfidenceSignal::BuildinfoMissing { reason } => {
-                eprintln!("  [-] buildinfo missing: {}", reason)
+                eprintln!("  [-] buildinfo missing: {reason}")
             }
             ConfidenceSignal::PclntabParsed { version, nfunc } => {
-                eprintln!("  [+] pclntab parsed: {:?} ({} funcs)", version, nfunc)
+                eprintln!("  [+] pclntab parsed: {version:?} ({nfunc} funcs)")
             }
             ConfidenceSignal::PclntabMissing { reason } => {
-                eprintln!("  [-] pclntab missing: {}", reason)
+                eprintln!("  [-] pclntab missing: {reason}")
             }
             ConfidenceSignal::GoVersionString { version, source } => {
-                eprintln!("  [+] go version: {} (source: {:?})", version, source)
+                eprintln!("  [+] go version: {version} (source: {source:?})")
             }
             ConfidenceSignal::HeuristicStringsMatched { hits } => {
-                eprintln!("  [+] heuristic strings matched: {}", hits)
+                eprintln!("  [+] heuristic strings matched: {hits}")
             }
         }
     }
@@ -127,7 +128,7 @@ fn print_header(
     size: usize,
 ) {
     println!("================================================================================");
-    println!("  Go Binary Analysis: {}", path);
+    println!("  Go Binary Analysis: {path}");
     println!("================================================================================");
     println!();
     println!("[Binary]");
@@ -153,12 +154,11 @@ fn print_header(
     println!();
 
     println!("[Target]");
+    println!("  Architecture : {:?}", bin.arch());
     if let Some(p) = bin.pclntab() {
-        println!("  Architecture : {:?}", p.arch());
         println!("  Pointer size : {} bytes", p.ptr_size);
-    } else {
-        println!("  Architecture : {:?}", Arch::Unknown);
     }
+    let _ = Arch::Unknown;
     if let Some(info) = bin.build_info() {
         println!("  GOOS         : {}", info.goos().unwrap_or("unknown"));
         println!("  GOARCH       : {}", info.goarch().unwrap_or("unknown"));
@@ -189,18 +189,18 @@ fn print_build_info(bin: &GoBinary<'_>) {
     println!();
 
     if let Some(ref path) = info.main_path {
-        println!("  Main path    : {}", path);
+        println!("  Main path    : {path}");
     }
     if let Some(ref module) = info.main_module {
         let ver = info.main_version.unwrap_or("");
-        println!("  Module       : {} {}", module, ver);
+        println!("  Module       : {module} {ver}");
     }
 
     // VCS info
     if let Some(vcs) = info.setting("vcs") {
-        print!("  VCS          : {}", vcs);
+        print!("  VCS          : {vcs}");
         if let Some(rev) = info.vcs_revision() {
-            print!(" @ {}", rev);
+            print!(" @ {rev}");
         }
         if info.vcs_modified() == Some(true) {
             print!(" (dirty)");
@@ -214,9 +214,9 @@ fn print_build_info(bin: &GoBinary<'_>) {
         println!("  Build settings:");
         for (key, value) in &info.build_settings {
             if !value.is_empty() {
-                println!("    {} = {}", key, value);
+                println!("    {key} = {value}");
             } else {
-                println!("    {}", key);
+                println!("    {key}");
             }
         }
         println!();
@@ -228,7 +228,7 @@ fn print_build_info(bin: &GoBinary<'_>) {
         for dep in &info.deps {
             print!("    {} {}", dep.path, dep.version.unwrap_or(""),);
             if let Some(ref sum) = dep.sum {
-                print!("  {}", sum);
+                print!("  {sum}");
             }
             println!();
             if let Some(ref r) = dep.replacement {
@@ -236,7 +236,7 @@ fn print_build_info(bin: &GoBinary<'_>) {
                     "      => {} {}{}",
                     r.path,
                     r.version.unwrap_or(""),
-                    r.sum.map(|s| format!("  {}", s)).unwrap_or_default(),
+                    r.sum.map(|s| format!("  {s}")).unwrap_or_default(),
                 );
             }
         }
@@ -322,12 +322,12 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
         let func_count = pkg_funcs.map(|f| f.len()).unwrap_or(0);
         let type_count = pkg_types.map(|t| t.len()).unwrap_or(0);
 
-        print!("  [{}]", pkg);
+        print!("  [{pkg}]");
         if func_count > 0 {
-            print!("  {} functions", func_count);
+            print!("  {func_count} functions");
         }
         if type_count > 0 {
-            print!("  {} types", type_count);
+            print!("  {type_count} types");
         }
         println!();
 
@@ -345,14 +345,14 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                 }
                 tags.push(format!("hash:0x{:08x}", t.hash));
                 match &t.detail {
-                    TypeDetail::Array { len, .. } => tags.push(format!("len:{}", len)),
+                    TypeDetail::Array { len, .. } => tags.push(format!("len:{len}")),
                     TypeDetail::Chan { dir, .. } => {
                         let d = match dir {
                             1 => "<-chan",
                             2 => "chan<-",
                             _ => "chan",
                         };
-                        tags.push(format!("dir:{}", d));
+                        tags.push(format!("dir:{d}"));
                     }
                     TypeDetail::Func {
                         in_count,
@@ -360,19 +360,19 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                         is_variadic,
                         ..
                     } => {
-                        tags.push(format!("in:{}", in_count));
-                        tags.push(format!("out:{}", out_count));
+                        tags.push(format!("in:{in_count}"));
+                        tags.push(format!("out:{out_count}"));
                         if *is_variadic {
                             tags.push("variadic".into());
                         }
                     }
                     TypeDetail::Interface { method_count, .. } => {
-                        tags.push(format!("iface_methods:{}", method_count));
+                        tags.push(format!("iface_methods:{method_count}"));
                     }
                     TypeDetail::Map { .. } => {}
                     TypeDetail::Pointer { .. } | TypeDetail::Slice { .. } => {}
                     TypeDetail::Struct { field_count, .. } => {
-                        tags.push(format!("fields:{}", field_count));
+                        tags.push(format!("fields:{field_count}"));
                     }
                     TypeDetail::None => {}
                 }
@@ -439,7 +439,7 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                     tags.push(format!("pcdata:{}", f.npcdata));
                 }
                 if let Some(id_name) = f.func_id_name() {
-                    tags.push(format!("funcID:{}", id_name));
+                    tags.push(format!("funcID:{id_name}"));
                 }
                 if f.flags != 0 {
                     let mut flag_parts = Vec::new();
@@ -472,10 +472,10 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
                 };
 
                 println!("    {} {}{}", prefix, f.short_name(), tag_str);
-                if let Some(src) = f.source_file {
-                    if *tier == PackageTier::User {
-                        println!("           src: {}", src);
-                    }
+                if let Some(src) = f.source_file
+                    && *tier == PackageTier::User
+                {
+                    println!("           src: {src}");
                 }
             }
         }
@@ -502,12 +502,12 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
     println!("  --- SUMMARY {:-<65}", "");
     println!();
     println!("  Total functions : {}", funcs.len());
-    println!("    User code     : {}", user_funcs);
-    println!("    Stdlib        : {}", stdlib_funcs);
-    println!("    Internal      : {}", internal_funcs);
-    println!("  Methods         : {}", method_funcs);
-    println!("  Closures        : {}", closure_funcs);
-    println!("  Using defer     : {}", defer_funcs);
+    println!("    User code     : {user_funcs}");
+    println!("    Stdlib        : {stdlib_funcs}");
+    println!("    Internal      : {internal_funcs}");
+    println!("  Methods         : {method_funcs}");
+    println!("  Closures        : {closure_funcs}");
+    println!("  Using defer     : {defer_funcs}");
     println!("  Total packages  : {}", packages.len());
     println!("  Total types     : {}", types.len());
     println!();
@@ -525,7 +525,10 @@ fn print_source_files(files: &[&str]) {
     for f in files {
         if f.contains("/libexec/src/") || f.contains("/go/src/") || f.contains("GOROOT") {
             if let Some(src_idx) = f.rfind("/src/") {
-                let after_src = &f[src_idx + 5..];
+                let after_src = match src_idx.checked_add(5).and_then(|start| f.get(start..)) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 let pkg = if let Some(last_slash) = after_src.rfind('/') {
                     &after_src[..last_slash]
                 } else {
@@ -544,7 +547,7 @@ fn print_source_files(files: &[&str]) {
         println!("  --- USER SOURCE FILES {:-<56}", "");
         println!();
         for f in &user_files {
-            println!("  {}", f);
+            println!("  {f}");
         }
         println!();
     }
@@ -562,7 +565,7 @@ fn print_source_files(files: &[&str]) {
             println!("  [{}]  ({} files)", pkg, pkg_files.len());
             for f in pkg_files {
                 let basename = f.rsplit('/').next().unwrap_or(f);
-                println!("    {}", basename);
+                println!("    {basename}");
             }
         }
         println!();

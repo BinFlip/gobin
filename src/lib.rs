@@ -34,11 +34,19 @@
 //!
 //! ## Supported Formats
 //!
-//! | Format | Detection | Build ID | Build Info | pclntab | Functions |
-//! |--------|-----------|----------|------------|---------|-----------|
-//! | ELF    | Yes       | ELF note + raw | Yes   | Yes     | Yes       |
-//! | Mach-O | Yes       | Raw marker     | Yes   | Yes     | Yes       |
-//! | PE     | Yes       | Raw marker     | Yes   | Yes     | Yes       |
+//! | Format | Detection | Build ID            | Build Info | pclntab | Functions |
+//! |--------|-----------|---------------------|------------|---------|-----------|
+//! | ELF    | Yes       | ELF note + raw      | Yes        | Yes     | Yes       |
+//! | Mach-O | Yes       | Raw marker          | Yes        | Yes     | Yes       |
+//! | PE     | Yes       | Raw marker          | Yes        | Yes     | Yes       |
+//! | Wasm   | Yes       | `go:buildid` section| Version only | Yes   | Yes       |
+//!
+//! Wasm support reconstructs a single linear-memory image from the wasm
+//! Data section's individual segments so runtime structures (pclntab,
+//! moduledata, type descriptors) that span multiple disjoint segments can
+//! be addressed by their linear-memory VA — see
+//! [`structures::wasm`](crate::structures::wasm) and the [`BinaryFormat::Wasm`]
+//! variant rustdoc for details.
 //!
 //! ## Architecture
 //!
@@ -50,16 +58,12 @@
 //! - **High-level**: [`GoBinary`] wraps `BinaryContext` and performs the full Go metadata
 //!   extraction pipeline, exposing comfortable accessors for functions, types, build info, etc.
 
-// This crate is used for malware analysis: every input byte is
-// adversarial and must not be allowed to panic the parser.
-#![deny(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
-)]
+// The `missing_docs`, `clippy::unwrap_used`, `clippy::expect_used`,
+// `clippy::panic`, `clippy::arithmetic_side_effects`, and
+// `clippy::indexing_slicing` lints are declared in `Cargo.toml` under
+// `[lints]` so they enforce on every build regardless of the consuming
+// workspace. gobin is used in malware-analysis pipelines where every
+// input byte is adversarial and the parser must not panic.
 #![cfg_attr(
     test,
     allow(
@@ -85,7 +89,7 @@ use crate::{
     structures::{
         buildid, buildinfo, inline, itab,
         moduledata::Moduledata,
-        pclntab::{self, FuncData, ParsedPclntab},
+        pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
         strings as gostrings, types,
     },
 };
@@ -108,7 +112,12 @@ pub struct GoBinary<'a> {
     ctx: BinaryContext<'a>,
     build_id: Option<&'a str>,
     build_info: Option<BuildInfo<'a>>,
-    pclntab: Option<ParsedPclntab<'a>>,
+    /// Cached pclntab scalars. The borrowing [`ParsedPclntab`] view is
+    /// reconstructed on demand via [`Self::pclntab`] so it can borrow from
+    /// `&self.ctx` — important for wasm, where the address space pclntab
+    /// lives in is the linear-memory image owned by the context (and is
+    /// therefore not borrowable with the input lifetime `'a`).
+    pclntab_meta: Option<PclntabMeta>,
     go_version: Option<&'a str>,
     moduledata: Option<Moduledata>,
 }
@@ -185,12 +194,12 @@ impl<'a> GoBinary<'a> {
             }
         }
 
-        let pclntab_result = pclntab::parse(&ctx);
-        match pclntab_result.as_ref() {
-            Some(p) => {
+        let pclntab_meta = pclntab::parse(&ctx).as_ref().map(ParsedPclntab::meta);
+        match pclntab_meta {
+            Some(m) => {
                 report.push(ConfidenceSignal::PclntabParsed {
-                    version: p.version,
-                    nfunc: p.nfunc,
+                    version: m.version,
+                    nfunc: m.nfunc,
                 });
                 report.raise_to(Confidence::High);
             }
@@ -229,16 +238,17 @@ impl<'a> GoBinary<'a> {
             return Err(ParseError::NotAGoBinary { report });
         }
 
-        let moduledata = pclntab_result
-            .as_ref()
-            .and_then(|p| find_moduledata(&ctx, p, go_version));
+        let moduledata = pclntab_meta.and_then(|meta| {
+            let pcl = meta.attach(ctx.structure_search_data())?;
+            find_moduledata(&ctx, &pcl, go_version)
+        });
 
         Ok(GoBinary {
             report,
             ctx,
             build_id,
             build_info: build_info_result,
-            pclntab: pclntab_result,
+            pclntab_meta,
             go_version,
             moduledata,
         })
@@ -296,8 +306,14 @@ impl<'a> GoBinary<'a> {
 
     /// The parsed pclntab, if found. Provides zero-copy access to function names,
     /// source files, architecture, pointer size, and all other pclntab metadata.
-    pub fn pclntab(&self) -> Option<&ParsedPclntab<'a>> {
-        self.pclntab.as_ref()
+    ///
+    /// Returned by value because the borrowing struct is rehydrated on each
+    /// call from cached metadata; the borrow inside it is tied to `&self`.
+    /// Callers that need to hold pclntab state across many calls should hold
+    /// `&self` (i.e. the [`GoBinary`]) for the duration; the rebuild itself
+    /// is just a struct construction (no I/O, no parsing).
+    pub fn pclntab(&self) -> Option<ParsedPclntab<'_>> {
+        self.pclntab_meta?.attach(self.ctx.structure_search_data())
     }
 
     /// Streaming iterator over every function recovered from the pclntab.
@@ -307,8 +323,8 @@ impl<'a> GoBinary<'a> {
     /// For bulk per-function processing where you also need decoded pcsp /
     /// pcln / pcfile tables, use [`crate::metadata::for_each_function`]
     /// instead — it amortizes table-decode buffers across the whole walk.
-    pub fn functions(&self) -> FunctionIter<'_, 'a> {
-        FunctionIter::new(self.pclntab.as_ref())
+    pub fn functions(&self) -> FunctionIter<'_> {
+        FunctionIter::new(self.pclntab())
     }
 
     /// Streaming iterator over the per-PC inlining tree for a function.
@@ -323,8 +339,8 @@ impl<'a> GoBinary<'a> {
     ///   expose this base, so funcdata cannot be resolved).
     ///
     /// Source: `src/runtime/symtabinl.go` (`inlineUnwinder`).
-    pub fn inline_tree<'p>(&'p self, func: &FuncData) -> inline::InlineTreeIter<'p, 'a> {
-        let pcl = match self.pclntab.as_ref() {
+    pub fn inline_tree(&self, func: &FuncData) -> inline::InlineTreeIter<'_> {
+        let pcl = match self.pclntab() {
             Some(p) => p,
             None => return inline::InlineTreeIter::empty(),
         };
@@ -342,19 +358,38 @@ impl<'a> GoBinary<'a> {
 
     /// Virtual address of `runtime.text` — the first byte of Go-emitted code.
     ///
-    /// To translate a [`crate::structures::pclntab::FuncData::entry_off`] (a
-    /// PC offset relative to `runtime.text`) into a binary-level VA:
-    ///
-    /// ```text
-    /// va  = bin.text_va()? + func.entry_off as u64
-    /// rva = va - image_base   // for image-base-relative formats (PE)
-    /// ```
-    ///
-    /// Note: `entry_off` is **not** a `goblin`-derived RVA. Without adding
-    /// `text_va`, addresses computed from `entry_off` will be wrong by the
-    /// distance between the image base and `runtime.text`.
+    /// `entry_off` on each [`FuncData`] is measured relative to this address.
+    /// In most cases callers should reach for [`Self::entry_va`] /
+    /// [`Self::entry_rva`] instead, which fold both the `text_va` lookup and
+    /// the (PE-only) image-base translation into one accessor.
     pub fn text_va(&self) -> Option<u64> {
         self.moduledata.as_ref().map(|m| m.text)
+    }
+
+    /// Binary-level virtual address of a function's entry point.
+    ///
+    /// Folds together `text_va + func.entry_off` so callers don't reimplement
+    /// the translation. Returns `None` when [`Self::text_va`] is unavailable
+    /// (binary lacks moduledata or VA mapping) or the addition overflows.
+    ///
+    /// For ELF and Mach-O this is the address a disassembler will use
+    /// directly. For PE this is still a true VA — pass it to
+    /// [`Self::entry_rva`] (or subtract [`BinaryContext::image_base`]) to get
+    /// the RVA most PE-aware tools expect.
+    pub fn entry_va(&self, func: &FuncData) -> Option<u64> {
+        self.text_va()?.checked_add(u64::from(func.entry_off))
+    }
+
+    /// Image-base-relative entry RVA.
+    ///
+    /// For PE binaries this returns `entry_va − image_base`, the form most PE
+    /// disassemblers index by. For ELF and Mach-O the image base is `0`, so
+    /// this is identical to [`Self::entry_va`].
+    ///
+    /// Returns `None` when [`Self::entry_va`] is unavailable or the binary's
+    /// `text_va` lies below the recorded image base (corrupt input).
+    pub fn entry_rva(&self, func: &FuncData) -> Option<u64> {
+        self.entry_va(func)?.checked_sub(self.ctx.image_base())
     }
 
     /// Virtual address of `runtime.etext` — one past the last byte of
@@ -364,6 +399,40 @@ impl<'a> GoBinary<'a> {
     /// useful as an "amount of Go code in this binary" metric.
     pub fn etext_va(&self) -> Option<u64> {
         self.moduledata.as_ref().map(|m| m.etext)
+    }
+
+    /// Target architecture, disambiguated using the binary container format.
+    ///
+    /// [`ParsedPclntab::arch`] derives the arch purely from `(minLC, ptrSize)`
+    /// header bytes, which conflates `Arch::X86_64` with `Arch::Wasm`
+    /// (both report `(1, 8)`). This accessor folds in the container format
+    /// to resolve the ambiguity:
+    ///
+    /// - [`BinaryFormat::Wasm`] always yields [`structures::Arch::Wasm`].
+    /// - Other formats defer to the pclntab-derived arch.
+    /// - When no pclntab is available, falls back to the build-info
+    ///   `GOARCH` setting if present, or [`structures::Arch::Unknown`].
+    pub fn arch(&self) -> structures::Arch {
+        use structures::Arch;
+        if self.ctx.format() == BinaryFormat::Wasm {
+            return Arch::Wasm;
+        }
+        if let Some(p) = self.pclntab() {
+            return p.arch();
+        }
+        match self.build_info.as_ref().and_then(BuildInfo::goarch) {
+            Some("386") => Arch::X86,
+            Some("amd64") => Arch::X86_64,
+            Some("arm") => Arch::Arm,
+            Some("arm64") => Arch::Arm64,
+            Some("mips") | Some("mipsle") => Arch::Mips32,
+            Some("mips64") | Some("mips64le") => Arch::Mips64,
+            Some("ppc64") | Some("ppc64le") => Arch::Ppc64,
+            Some("riscv64") => Arch::RiscV,
+            Some("s390x") => Arch::S390x,
+            Some("wasm") => Arch::Wasm,
+            _ => Arch::Unknown,
+        }
     }
 
     /// Which Go compiler toolchain produced this binary.
@@ -389,7 +458,7 @@ impl<'a> GoBinary<'a> {
         {
             return Compiler::TinyGo;
         }
-        if self.pclntab.is_some() {
+        if self.pclntab_meta.is_some() {
             return Compiler::Gc;
         }
         Compiler::Unknown
@@ -403,7 +472,7 @@ impl<'a> GoBinary<'a> {
     /// - Scrubbed module dependency list (typical of `garble -tiny`).
     /// - Buildinfo missing or buildinfo deps absent (`-trimpath`-like).
     pub fn obfuscation(&self) -> ObfuscationKind {
-        if self.pclntab.is_none() {
+        if self.pclntab_meta.is_none() {
             return ObfuscationKind::None;
         }
 
@@ -486,8 +555,8 @@ impl<'a> GoBinary<'a> {
     ///
     /// Useful for "what implements `io.Reader` in this binary?" queries —
     /// pair with [`Self::types`] to resolve each VA back to a named type.
-    pub fn itab_pairs(&self) -> itab::ItabIter<'_, 'a> {
-        let ptr_size = self.pclntab.as_ref().map(|p| p.ptr_size).unwrap_or(0);
+    pub fn itab_pairs(&self) -> itab::ItabIter<'_> {
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
         let itablinks = self
             .moduledata
             .as_ref()
@@ -532,17 +601,17 @@ impl<'a> GoBinary<'a> {
     ///
     /// Collect with `bin.types().collect::<Vec<_>>()` if you need an owned
     /// container.
-    pub fn types(&self) -> types::TypeIter<'_, 'a> {
-        let pclntab = match self.pclntab.as_ref() {
-            Some(p) => p,
+    pub fn types(&self) -> types::TypeIter<'_> {
+        let meta = match self.pclntab_meta {
+            Some(m) => m,
             None => return types::extract_types_iter(&self.ctx, 0, None, None, None),
         };
         let go_version_minor = self.go_version().and_then(parse_go_minor_version);
         types::extract_types_iter(
             &self.ctx,
-            pclntab.ptr_size,
-            Some(pclntab.version),
-            Some(pclntab.offset),
+            meta.ptr_size,
+            Some(meta.version),
+            Some(meta.offset),
             go_version_minor,
         )
     }
@@ -556,12 +625,16 @@ impl<'a> GoBinary<'a> {
     /// on Go binaries.
     ///
     /// Yields zero items when the binary lacks VA mapping. Length filter:
-    /// 2..=4096 bytes. UTF-8 validated. Pointers into the text segment
-    /// (`[moduledata.text, moduledata.etext)`) are excluded. **Duplicates
-    /// are not filtered** — a string referenced from N positions yields N
-    /// times. Collect into a `HashSet<&str>` if you want unique results.
-    pub fn strings(&self) -> gostrings::GoStringIter<'_, 'a> {
-        let ptr_size = self.pclntab.as_ref().map(|p| p.ptr_size).unwrap_or(0);
+    /// 2..=4096 bytes. UTF-8 is **not** required — malware frequently stashes
+    /// non-UTF-8 payloads in length-prefixed rodata entries; use
+    /// [`gostrings::GoString::as_bytes`] for raw bytes,
+    /// [`gostrings::GoString::try_as_str`] / [`gostrings::GoString::as_str`]
+    /// for text. Pointers into the text segment (`[moduledata.text,
+    /// moduledata.etext)`) are excluded. **Duplicates are not filtered** —
+    /// a string referenced from N positions yields N times. Collect into a
+    /// `HashSet` if you want unique results.
+    pub fn strings(&self) -> gostrings::GoStringIter<'_> {
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
         gostrings::extract_iter(&self.ctx, self.moduledata.as_ref(), ptr_size)
     }
 }
@@ -724,6 +797,78 @@ fn find_moduledata(
         return find_moduledata_pe(ctx, pclntab, has_typelink, go_minor);
     }
 
+    if ctx.format() == BinaryFormat::Wasm {
+        return find_moduledata_wasm(ctx, pclntab, has_typelink, go_minor);
+    }
+
+    None
+}
+
+/// Wasm moduledata discovery: scan the linear-memory image for a
+/// pointer-aligned `u64` equal to the pcHeader's linear-memory address, then
+/// validate by parsing.
+///
+/// For wasm, [`ParsedPclntab::offset`] is already a linear-memory address
+/// (the parser ran on the reconstructed linear-memory image, not on file
+/// bytes), so no `file_to_va` translation is needed.
+fn find_moduledata_wasm(
+    ctx: &BinaryContext<'_>,
+    pclntab: &ParsedPclntab<'_>,
+    has_typelink: bool,
+    go_minor: Option<u32>,
+) -> Option<Moduledata> {
+    let lm = ctx.structure_search_data();
+    let ps = pclntab.ptr_size as usize;
+    if ps == 0 {
+        return None;
+    }
+    let pclntab_va = pclntab.offset as u64;
+    let target_bytes: Vec<u8> = match pclntab.ptr_size {
+        4 => (pclntab_va as u32).to_le_bytes().to_vec(),
+        8 => pclntab_va.to_le_bytes().to_vec(),
+        _ => return None,
+    };
+
+    let mut offset: usize = 0;
+    while let Some(end) = offset.checked_add(ps) {
+        if end > lm.len() {
+            break;
+        }
+        let rem = offset.checked_rem(ps).unwrap_or(0);
+        if rem != 0 {
+            let bump = ps.saturating_sub(rem);
+            offset = match offset.checked_add(bump) {
+                Some(o) => o,
+                None => break,
+            };
+            continue;
+        }
+        let window = match lm.get(offset..end) {
+            Some(w) => w,
+            None => break,
+        };
+        if window == target_bytes.as_slice() {
+            let remaining = match lm.get(offset..) {
+                Some(r) => r,
+                None => break,
+            };
+            if let Some(md) = Moduledata::parse(
+                remaining,
+                pclntab.ptr_size,
+                pclntab.version,
+                has_typelink,
+                go_minor,
+            ) && md.minpc < md.maxpc
+                && md.types != 0
+            {
+                return Some(md);
+            }
+        }
+        offset = match offset.checked_add(ps) {
+            Some(o) => o,
+            None => break,
+        };
+    }
     None
 }
 
@@ -778,13 +923,11 @@ fn find_moduledata_pe(
                 pclntab.version,
                 has_typelink,
                 go_minor,
-            ) {
-                if md.minpc < md.maxpc
-                    && md.types != 0
-                    && ctx.va_to_file(md.funcnametab.ptr).is_some()
-                {
-                    return Some(md);
-                }
+            ) && md.minpc < md.maxpc
+                && md.types != 0
+                && ctx.va_to_file(md.funcnametab.ptr).is_some()
+            {
+                return Some(md);
             }
         }
         offset = match offset.checked_add(ps) {
