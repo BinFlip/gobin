@@ -1,6 +1,6 @@
 [package]
 name = "gobin"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -27,6 +27,21 @@ arithmetic_side_effects = "deny"
 indexing_slicing = "deny"
 
 [dependencies]
-goblin = "0.10.5"
+# We only parse single ELF / Mach-O / PE executables (the three formats
+# dispatched in `formats.rs`), so drop goblin's default `te` (UEFI Terse
+# Executable) feature — not a Go output format. (`archive` cannot be
+# dropped: goblin's `mach32`/`mach64` features hard-require it.) PE
+# resource/import/cert/TLS *parsing* is disabled separately at the call
+# site via `ParseOptions`. `endian_fd` + `std` stay for sliced reads.
+goblin = { version = "0.10.7", default-features = false, features = [
+    "elf32",
+    "elf64",
+    "mach32",
+    "mach64",
+    "pe32",
+    "pe64",
+    "endian_fd",
+    "std",
+] }
 
 [dev-dependencies]

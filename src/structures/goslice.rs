@@ -18,6 +18,39 @@ pub struct GoSlice {
     pub cap: u64,
 }
 
+/// A Go string header: `(ptr, len)`, each pointer-sized.
+///
+/// Go strings are `(data *byte, len int)`. Unlike a [`GoSlice`] there is no
+/// capacity. Resolve `ptr`/`len` to bytes via the address-space view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoStr {
+    /// Virtual address of the string bytes.
+    pub ptr: u64,
+    /// Length in bytes.
+    pub len: u64,
+}
+
+impl GoStr {
+    /// Binary size: 2 * pointer_size.
+    pub fn size(ps: u8) -> usize {
+        (ps as usize).saturating_mul(2)
+    }
+
+    /// Parse from raw bytes at the given offset.
+    pub fn parse(data: &[u8], offset: usize, ps: u8) -> Option<Self> {
+        let p = ps as usize;
+        Some(Self {
+            ptr: read_uintptr(data, offset, ps)?,
+            len: read_uintptr(data, offset.checked_add(p)?, ps)?,
+        })
+    }
+
+    /// Whether the string is empty (zero length).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 impl GoSlice {
     /// Binary size: 3 * pointer_size.
     pub fn size(ps: u8) -> usize {

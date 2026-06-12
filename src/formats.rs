@@ -30,11 +30,22 @@
 //! - Section name mapping: `go:buildinfo` symbol -> `.go.buildinfo` section
 //!   (`src/cmd/link/internal/ld/data.go:1831-1832`)
 
-use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+use goblin::{
+    elf::{
+        Elf,
+        program_header::{PT_LOAD, PT_NOTE},
+        section_header::SHT_NOBITS,
+    },
+    mach::{MachO, load_command::CommandVariant},
+    pe::{PE, options::ParseOptions},
+};
 
 use crate::{
     detection::find_bytes,
-    structures::wasm::{build_linear_memory_image, walk as walk_wasm_sections},
+    structures::{
+        fixups::rebase,
+        wasm::{build_linear_memory_image, walk as walk_wasm_sections},
+    },
 };
 
 /// The executable format of the binary being analyzed.
@@ -102,6 +113,9 @@ pub struct GoSections {
     pub typelink: Option<SectionRange>,
     /// File byte range of the itablink section (ELF only).
     pub itablink: Option<SectionRange>,
+    /// File byte range of the FIPS-140 info section (`.go.fipsinfo` /
+    /// `__go_fipsinfo`, Go 1.24+). Present only in FIPS-mode builds.
+    pub fipsinfo: Option<SectionRange>,
 }
 
 /// A contiguous byte range within the binary file, with its virtual address.
@@ -162,6 +176,12 @@ pub struct BinaryContext<'a> {
     /// from the LM image (`ParsedPclntab`, `GoType`, etc.) borrow with the
     /// same `&self` lifetime.
     wasm_lm: Option<Box<[u8]>>,
+    /// Owned, rebased copy of the file bytes for externally-linked Mach-O
+    /// objects that use chained fixups (`LC_DYLD_CHAINED_FIXUPS`). Identical
+    /// layout to the input, but every chained pointer slot holds its resolved
+    /// virtual address so pointer reads work as on an ordinary binary. `None`
+    /// for binaries without chained fixups. See [`structures::macho_fixups`].
+    rebased: Option<Box<[u8]>>,
 }
 
 impl<'a> BinaryContext<'a> {
@@ -181,23 +201,32 @@ impl<'a> BinaryContext<'a> {
             go_module: None,
             typelink: None,
             itablink: None,
+            fipsinfo: None,
         };
         let mut segments = Vec::new();
         let mut elf_note_segments = Vec::new();
         let mut image_base: u64 = 0;
+        // Mach-O segment `(vmaddr, fileoff)` in load-command order, and the
+        // `LC_DYLD_CHAINED_FIXUPS` data offset — both needed to rebase chained
+        // fixups in externally-linked objects (plugins / CGO / c-shared).
+        let mut macho_segments: Vec<(u64, u64)> = Vec::new();
+        let mut chained_fixups_off: Option<usize> = None;
 
-        if let Ok(obj) = goblin::Object::parse(data) {
-            match obj {
-                goblin::Object::Elf(elf) => {
+        // Dispatch on the detected format and call the per-format goblin
+        // parser directly rather than `goblin::Object::parse`. The unified
+        // `Object` parser pulls in goblin's `archive` and `te` features (it
+        // can return ar-archive / UEFI variants), neither of which is a Go
+        // output format; dispatching ourselves lets us drop those features.
+        match format {
+            BinaryFormat::Elf => {
+                if let Ok(elf) = Elf::parse(data) {
                     // Sections → GoSections
                     for sh in &elf.section_headers {
                         let name = match elf.shdr_strtab.get_at(sh.sh_name) {
                             Some(n) => n,
                             None => continue,
                         };
-                        let range = if sh.sh_type != goblin::elf::section_header::SHT_NOBITS
-                            && sh.sh_size > 0
-                        {
+                        let range = if sh.sh_type != SHT_NOBITS && sh.sh_size > 0 {
                             Some(SectionRange {
                                 offset: sh.sh_offset as usize,
                                 size: sh.sh_size as usize,
@@ -223,8 +252,21 @@ impl<'a> BinaryContext<'a> {
                         }
                     }
                 }
-                goblin::Object::Mach(goblin::mach::Mach::Binary(ref macho)) => {
+            }
+            BinaryFormat::MachO => {
+                // `MachO::parse(.., 0)` handles a thin (non-fat) Mach-O — the
+                // only Mach variant the original `Mach::Binary` arm processed.
+                if let Ok(macho) = MachO::parse(data, 0) {
+                    // Locate the chained-fixups load command, if present.
+                    for lc in &macho.load_commands {
+                        if let CommandVariant::DyldChainedFixups(c) = &lc.command {
+                            chained_fixups_off = Some(c.dataoff as usize);
+                        }
+                    }
                     for seg in &macho.segments {
+                        // Per-segment (vmaddr, fileoff) in load order — the
+                        // fixup chains index segments by this order.
+                        macho_segments.push((seg.vmaddr, seg.fileoff));
                         // VA mapping
                         if seg.filesize > 0 {
                             segments.push((seg.vmaddr, seg.fileoff, seg.filesize));
@@ -245,7 +287,18 @@ impl<'a> BinaryContext<'a> {
                         }
                     }
                 }
-                goblin::Object::PE(pe) => {
+            }
+            BinaryFormat::Pe => {
+                // We read only the optional header's image base and the
+                // section table. Disable goblin's resource, import,
+                // certificate, and TLS parsing — Go binaries can carry large
+                // import/resource tables we never touch, and skipping them is
+                // a straight efficiency win with no effect on what we use.
+                let opts = ParseOptions::default()
+                    .with_parse_resources(false)
+                    .with_parse_imports(false)
+                    .with_parse_tls_data(false);
+                if let Ok(pe) = PE::parse_with_opts(data, &opts) {
                     image_base = pe.image_base;
                     for section in &pe.sections {
                         let va = image_base.saturating_add(section.virtual_address as u64);
@@ -270,8 +323,8 @@ impl<'a> BinaryContext<'a> {
                         classify_section(name, range, &mut sections);
                     }
                 }
-                _ => {}
             }
+            BinaryFormat::Wasm | BinaryFormat::Unknown => {}
         }
 
         // ELF fallback: check PT_NOTE segments for the Go note identifier
@@ -310,6 +363,21 @@ impl<'a> BinaryContext<'a> {
             }
         }
 
+        // Externally-linked Mach-O (plugins / CGO / c-shared) stores data
+        // pointers as chained fixups; rebase them so pointer reads resolve.
+        let rebased = match (format, chained_fixups_off) {
+            (BinaryFormat::MachO, Some(off)) => {
+                let base = macho_segments
+                    .iter()
+                    .find(|(_, fo)| *fo == 0)
+                    .map(|(va, _)| *va)
+                    .or_else(|| macho_segments.iter().map(|(va, _)| *va).min())
+                    .unwrap_or(0);
+                rebase(data, off, &macho_segments, base).map(Vec::into_boxed_slice)
+            }
+            _ => None,
+        };
+
         Self {
             data,
             format,
@@ -318,6 +386,7 @@ impl<'a> BinaryContext<'a> {
             elf_note_segments,
             image_base,
             wasm_lm,
+            rebased,
         }
     }
 
@@ -390,10 +459,13 @@ impl<'a> BinaryContext<'a> {
     /// across method calls) should store scalar metadata and re-derive
     /// borrowing structs on demand.
     pub fn structure_search_data(&self) -> &[u8] {
-        match self.wasm_lm.as_deref() {
-            Some(lm) => lm,
-            None => self.data,
+        if let Some(lm) = self.wasm_lm.as_deref() {
+            return lm;
         }
+        if let Some(rebased) = self.rebased.as_deref() {
+            return rebased;
+        }
+        self.data
     }
 
     /// Borrow a slice starting at the byte at virtual address `va`.
@@ -493,6 +565,9 @@ fn classify_section(name: &str, range: Option<SectionRange>, result: &mut GoSect
         }
         ".itablink" | "__itablink" => {
             result.itablink = range;
+        }
+        ".go.fipsinfo" | "__go_fipsinfo" => {
+            result.fipsinfo = range;
         }
         _ => {}
     }

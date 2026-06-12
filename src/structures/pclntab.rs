@@ -150,6 +150,17 @@ pub struct ParsedPclntab<'a> {
     pub pctab_offset: usize,
     /// Offset from pcHeader to the start of `functab` (function table + `_func` structs).
     pub functab_offset: usize,
+    /// Absolute base PC that per-function `entryoff` values are measured from.
+    ///
+    /// Go 1.18+ stores `entryoff` directly in the functab/`_func` (relative to
+    /// `runtime.text`), so this is `0`. Go 1.16-1.17 stored *absolute* PCs in
+    /// the functab; we record the first (lowest) function PC here and subtract
+    /// it so `FuncData::entry_off` is a relative offset for every version.
+    pub text_start: u64,
+    /// The pcHeader's `textStart` field (the `runtime.text` VA), added to the
+    /// header in Go 1.18. `None` for Go 1.16-1.17, which lack the field.
+    /// Mirrors `moduledata.text`.
+    pub header_text_start: Option<u64>,
 }
 
 /// Scalar metadata of a [`ParsedPclntab`] without the borrowed `data`.
@@ -183,6 +194,10 @@ pub struct PclntabMeta {
     pub pctab_offset: usize,
     /// See [`ParsedPclntab::functab_offset`].
     pub functab_offset: usize,
+    /// See [`ParsedPclntab::text_start`].
+    pub text_start: u64,
+    /// See [`ParsedPclntab::header_text_start`].
+    pub header_text_start: Option<u64>,
 }
 
 impl PclntabMeta {
@@ -215,6 +230,8 @@ impl PclntabMeta {
             filetab_offset: self.filetab_offset,
             pctab_offset: self.pctab_offset,
             functab_offset: self.functab_offset,
+            text_start: self.text_start,
+            header_text_start: self.header_text_start,
         })
     }
 }
@@ -235,6 +252,8 @@ impl<'a> ParsedPclntab<'a> {
             filetab_offset: self.filetab_offset,
             pctab_offset: self.pctab_offset,
             functab_offset: self.functab_offset,
+            text_start: self.text_start,
+            header_text_start: self.header_text_start,
         }
     }
 
@@ -288,6 +307,9 @@ impl<'a> ParsedPclntab<'a> {
             base: self.functab_offset,
             index: 0,
             count: self.nfunc,
+            version: self.version,
+            ptr_size: self.ptr_size,
+            text_start: self.text_start,
         }
     }
 
@@ -302,24 +324,40 @@ impl<'a> ParsedPclntab<'a> {
     pub fn parse_func(&self, func_off: u32) -> Option<FuncData> {
         let off = self.functab_offset.checked_add(func_off as usize)?;
         let d = self.data.get(off..)?;
-        if d.len() < 44 {
+        let lay = func_layout(self.version, self.ptr_size);
+        if d.len() < lay.size {
             return None;
         }
+        // Go 1.16-1.17 store an absolute PC; rebase to an offset like 1.18+.
+        let entry_off = if lay.entry_is_abs {
+            let abs = read_uintptr(d, 0, self.ptr_size)?;
+            u32::try_from(abs.saturating_sub(self.text_start)).unwrap_or(u32::MAX)
+        } else {
+            u32::from_le_bytes(slice_at::<4>(d, 0)?)
+        };
+        let start_line = match lay.start_line {
+            Some(o) => i32::from_le_bytes(slice_at::<4>(d, o)?),
+            None => 0,
+        };
+        let flag = match lay.flag {
+            Some(o) => *d.get(o)?,
+            None => 0,
+        };
         Some(FuncData {
             func_off,
-            entry_off: u32::from_le_bytes(slice_at::<4>(d, 0)?),
-            name_off: i32::from_le_bytes(slice_at::<4>(d, 4)?),
-            args: i32::from_le_bytes(slice_at::<4>(d, 8)?),
-            deferreturn: u32::from_le_bytes(slice_at::<4>(d, 12)?),
-            pcsp: u32::from_le_bytes(slice_at::<4>(d, 16)?),
-            pcfile: u32::from_le_bytes(slice_at::<4>(d, 20)?),
-            pcln: u32::from_le_bytes(slice_at::<4>(d, 24)?),
-            npcdata: u32::from_le_bytes(slice_at::<4>(d, 28)?),
-            cu_offset: u32::from_le_bytes(slice_at::<4>(d, 32)?),
-            start_line: i32::from_le_bytes(slice_at::<4>(d, 36)?),
-            func_id: *d.get(40)?,
-            flag: *d.get(41)?,
-            nfuncdata: *d.get(43)?,
+            entry_off,
+            name_off: i32::from_le_bytes(slice_at::<4>(d, lay.name_off)?),
+            args: i32::from_le_bytes(slice_at::<4>(d, lay.args)?),
+            deferreturn: u32::from_le_bytes(slice_at::<4>(d, lay.deferreturn)?),
+            pcsp: u32::from_le_bytes(slice_at::<4>(d, lay.pcsp)?),
+            pcfile: u32::from_le_bytes(slice_at::<4>(d, lay.pcfile)?),
+            pcln: u32::from_le_bytes(slice_at::<4>(d, lay.pcln)?),
+            npcdata: u32::from_le_bytes(slice_at::<4>(d, lay.npcdata)?),
+            cu_offset: u32::from_le_bytes(slice_at::<4>(d, lay.cu_offset)?),
+            start_line,
+            func_id: *d.get(lay.func_id)?,
+            flag,
+            nfuncdata: *d.get(lay.nfuncdata)?,
         })
     }
 
@@ -334,7 +372,7 @@ impl<'a> ParsedPclntab<'a> {
         let base = self
             .functab_offset
             .checked_add(func.func_off as usize)?
-            .checked_add(44)?;
+            .checked_add(func_layout(self.version, self.ptr_size).size)?;
         let pos = base.checked_add((i as usize).checked_mul(4)?)?;
         Some(u32::from_le_bytes(slice_at::<4>(self.data, pos)?))
     }
@@ -352,7 +390,7 @@ impl<'a> ParsedPclntab<'a> {
         let base = self
             .functab_offset
             .checked_add(func.func_off as usize)?
-            .checked_add(44)?;
+            .checked_add(func_layout(self.version, self.ptr_size).size)?;
         let pcdata_bytes = (func.npcdata as usize).checked_mul(4)?;
         let after_pcdata = base.checked_add(pcdata_bytes)?;
         let pos = after_pcdata.checked_add((i as usize).checked_mul(4)?)?;
@@ -503,11 +541,18 @@ impl<'a> ParsedPclntab<'a> {
 }
 
 /// Streaming iterator over functab `(entryoff, funcoff)` pairs.
+///
+/// Go 1.18+ entries are two `u32`s (8 bytes); Go 1.16-1.17 entries are two
+/// `uintptr`s with an *absolute* `entry` PC, which we rebase against
+/// [`ParsedPclntab::text_start`] so both yield relative offsets.
 pub struct FuncEntryIter<'a> {
     data: &'a [u8],
     base: usize,
     index: usize,
     count: usize,
+    version: PclntabVersion,
+    ptr_size: u8,
+    text_start: u64,
 }
 
 impl Iterator for FuncEntryIter<'_> {
@@ -517,13 +562,29 @@ impl Iterator for FuncEntryIter<'_> {
         if self.index >= self.count {
             return None;
         }
-        let off = self
-            .index
-            .checked_mul(8)
-            .and_then(|d| self.base.checked_add(d))?;
-        let entry_off = u32::from_le_bytes(slice_at::<4>(self.data, off)?);
-        let func_off_pos = off.checked_add(4)?;
-        let func_off = u32::from_le_bytes(slice_at::<4>(self.data, func_off_pos)?);
+        let (entry_off, func_off) =
+            if matches!(self.version, PclntabVersion::Go12 | PclntabVersion::Go116) {
+                let ps = self.ptr_size as usize;
+                let stride = ps.checked_mul(2)?;
+                let off = self
+                    .index
+                    .checked_mul(stride)
+                    .and_then(|d| self.base.checked_add(d))?;
+                let entry_abs = read_uintptr(self.data, off, self.ptr_size)?;
+                let funcoff = read_uintptr(self.data, off.checked_add(ps)?, self.ptr_size)?;
+                let eo =
+                    u32::try_from(entry_abs.saturating_sub(self.text_start)).unwrap_or(u32::MAX);
+                let fo = u32::try_from(funcoff).unwrap_or(u32::MAX);
+                (eo, fo)
+            } else {
+                let off = self
+                    .index
+                    .checked_mul(8)
+                    .and_then(|d| self.base.checked_add(d))?;
+                let eo = u32::from_le_bytes(slice_at::<4>(self.data, off)?);
+                let fo = u32::from_le_bytes(slice_at::<4>(self.data, off.checked_add(4)?)?);
+                (eo, fo)
+            };
         self.index = self.index.checked_add(1)?;
         Some((entry_off, func_off))
     }
@@ -1308,7 +1369,15 @@ fn parse_header(
     }
 
     let ps = ptr_size as usize;
-    let header_size = advance_n(8, 8, ps)?;
+
+    // The `textStart` field was added to the pcHeader in Go 1.18. Go 1.16-1.17
+    // omit it, so their offset fields (funcnameOffset..pclnOffset) sit one
+    // pointer slot earlier.
+    let off_base: usize = match version {
+        PclntabVersion::Go12 | PclntabVersion::Go116 => 2,
+        _ => 3,
+    };
+    let header_size = advance_n(8, off_base.saturating_add(5), ps)?;
     if data.len() < header_size {
         return None;
     }
@@ -1323,11 +1392,11 @@ fn parse_header(
 
     let nfunc = read_field(0)?;
     let nfiles = read_field(1)?;
-    let funcname_offset = read_field(3)?;
-    let cu_offset = read_field(4)?;
-    let filetab_offset = read_field(5)?;
-    let pctab_offset = read_field(6)?;
-    let functab_offset = read_field(7)?;
+    let funcname_offset = read_field(off_base)?;
+    let cu_offset = read_field(off_base.saturating_add(1))?;
+    let filetab_offset = read_field(off_base.saturating_add(2))?;
+    let pctab_offset = read_field(off_base.saturating_add(3))?;
+    let functab_offset = read_field(off_base.saturating_add(4))?;
 
     // Sanity: reject obviously bogus values
     if nfunc > 10_000_000 || nfiles > 10_000_000 {
@@ -1336,6 +1405,25 @@ fn parse_header(
     if funcname_offset > data.len() || filetab_offset > data.len() || functab_offset > data.len() {
         return None;
     }
+
+    // Go 1.16-1.17 functab entries hold *absolute* PCs. Record the first
+    // (lowest) function's PC so we can present relative `entry_off`s like newer
+    // versions do. Go 1.18+ already stores offsets, so this stays 0.
+    let text_start = match version {
+        PclntabVersion::Go12 | PclntabVersion::Go116 => {
+            read_uintptr(data, functab_offset, ptr_size).unwrap_or(0)
+        }
+        _ => 0,
+    };
+
+    // The pcHeader gained a `textStart` field at index 2 in Go 1.18; Go
+    // 1.16-1.17 (off_base == 2) do not have it.
+    let header_text_start = if off_base > 2 {
+        let off = advance_n(8, 2, ps)?;
+        read_uintptr(data, off, ptr_size)
+    } else {
+        None
+    };
 
     Some(ParsedPclntab {
         data,
@@ -1350,7 +1438,97 @@ fn parse_header(
         filetab_offset,
         pctab_offset,
         functab_offset,
+        text_start,
+        header_text_start,
     })
+}
+
+/// Byte offsets of the fields within a `_func` struct, which changed shape
+/// across Go versions:
+///
+/// - **Go 1.16-1.17**: leads with an absolute `entry uintptr`; no `startLine`,
+///   no `flag`. Size `ptrSize + 36`.
+/// - **Go 1.18-1.19**: `u32` `entryoff`; adds `flag`; still no `startLine`.
+///   Size `40`.
+/// - **Go 1.20+**: adds `startLine`. Size `44`.
+#[derive(Clone, Copy)]
+struct FuncLayout {
+    /// Total struct size — the stride before the `pcdata`/`funcdata` arrays.
+    size: usize,
+    /// Whether the leading `entry` field is a pointer-sized absolute PC
+    /// (Go 1.16-1.17) rather than a `u32` offset.
+    entry_is_abs: bool,
+    name_off: usize,
+    args: usize,
+    deferreturn: usize,
+    pcsp: usize,
+    pcfile: usize,
+    pcln: usize,
+    npcdata: usize,
+    cu_offset: usize,
+    /// `startLine` offset (Go 1.20+), else `None` (read as 0).
+    start_line: Option<usize>,
+    func_id: usize,
+    /// `flag` offset (Go 1.18+), else `None` (read as 0).
+    flag: Option<usize>,
+    nfuncdata: usize,
+}
+
+fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
+    let p = ptr_size as usize;
+    match version {
+        // Go 1.16-1.17 (and the legacy Go12 path): entry uintptr @0.
+        PclntabVersion::Go12 | PclntabVersion::Go116 => FuncLayout {
+            size: p.saturating_add(36),
+            entry_is_abs: true,
+            name_off: p,
+            args: p.saturating_add(4),
+            deferreturn: p.saturating_add(8),
+            pcsp: p.saturating_add(12),
+            pcfile: p.saturating_add(16),
+            pcln: p.saturating_add(20),
+            npcdata: p.saturating_add(24),
+            cu_offset: p.saturating_add(28),
+            start_line: None,
+            func_id: p.saturating_add(32),
+            flag: None,
+            nfuncdata: p.saturating_add(35),
+        },
+        // Go 1.18-1.19: u32 entryoff @0, +flag, no startLine.
+        PclntabVersion::Go118 => FuncLayout {
+            size: 40,
+            entry_is_abs: false,
+            name_off: 4,
+            args: 8,
+            deferreturn: 12,
+            pcsp: 16,
+            pcfile: 20,
+            pcln: 24,
+            npcdata: 28,
+            cu_offset: 32,
+            start_line: None,
+            func_id: 36,
+            flag: Some(37),
+            nfuncdata: 39,
+        },
+        // Go 1.20+: +startLine.
+        PclntabVersion::Go120 => FuncLayout {
+            size: 44,
+            entry_is_abs: false,
+            name_off: 4,
+            args: 8,
+            deferreturn: 12,
+            pcsp: 16,
+            pcfile: 20,
+            pcln: 24,
+            npcdata: 28,
+            cu_offset: 32,
+            start_line: Some(36),
+            func_id: 40,
+            flag: Some(41),
+            nfuncdata: 43,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1468,6 +1646,7 @@ mod tests {
             go_module: None,
             typelink: None,
             itablink: None,
+            fipsinfo: None,
         };
 
         let parsed = scan_relaxed(&data, &sections).unwrap();

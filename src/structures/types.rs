@@ -23,6 +23,8 @@
 //! - Type walking: `src/runtime/type.go:522-545` (`moduleTypelinks`)
 //! - Moduledata: `src/runtime/symtab.go:402-450`
 
+use std::collections::{HashSet, VecDeque};
+
 use crate::{
     formats::{BinaryContext, BinaryFormat},
     metadata::{is_internal_path, is_runtime_path, is_stdlib_path},
@@ -39,10 +41,13 @@ use crate::{
         method::GoImethod,
         method::GoMethod,
         moduledata::Moduledata,
-        name::{NAME_FLAG_EMBEDDED, NAME_FLAG_EXPORTED, decode_name, decode_name_with_flags},
+        name::{
+            NAME_FLAG_EMBEDDED, NAME_FLAG_EXPORTED, decode_name, decode_name_and_tag,
+            decode_name_with_flags,
+        },
         structtype::{GoStructField, StructTypeExtra},
         uncommon::UncommonType,
-        util::align_up_u64,
+        util::{align_up, align_up_u64, read_uintptr},
     },
 };
 
@@ -53,6 +58,9 @@ use crate::{
 /// or `.clone()` and convert borrows to owned `String`s at the boundary.
 #[derive(Debug, Clone)]
 pub struct GoType<'a> {
+    /// Virtual address of this type's `abi.Type` descriptor. `0` if unknown
+    /// (the value was constructed without a known location).
+    pub descriptor_va: u64,
     /// Full type name as stored in the binary (e.g. `"*net/http.Client"`).
     pub name: &'a str,
     /// Type kind (Bool, Int, Struct, Pointer, Slice, etc.).
@@ -67,6 +75,23 @@ pub struct GoType<'a> {
     pub ptr_bytes: u64,
     /// Hash of the type, used for map key comparison and interface dispatch.
     pub hash: u32,
+    /// Raw `TFlag` byte (`abi.TFlag*` bits: uncommon, extra-star, named,
+    /// regular-memory, gc-mask-on-demand, direct-iface). `is_named` /
+    /// `is_exported` are derived from it; this exposes the unparsed value.
+    pub tflag: u8,
+    /// `PtrToThis` — `TypeOff` (offset from `moduledata.types`) of the
+    /// pointer-to-this (`*T`) type descriptor, or `0` if the linker emitted
+    /// none.
+    pub ptr_to_this: i32,
+    /// VA of the type's equality function (`abi.Type.Equal`), or `0`.
+    pub equal_va: u64,
+    /// VA of the type's GC bitmap (`abi.Type.GCData`), or `0`.
+    pub gcdata_va: u64,
+    /// Package import path from the [`UncommonType`] (e.g.
+    /// `"net/http"`), if this is a named type with methods. `None` for types
+    /// without an uncommon section. Distinct from [`Self::package`], which is
+    /// derived from the type name.
+    pub pkg_path: Option<&'a str>,
     /// Whether this type has an UncommonType (methods, package path).
     pub has_uncommon: bool,
     /// Whether this is a named type (has a declared name vs anonymous).
@@ -85,6 +110,20 @@ pub struct GoType<'a> {
     pub methods: Vec<MethodEntry<'a>>,
 }
 
+/// A reference to another type descriptor: its virtual address plus, when it
+/// resolves, the type's display name (e.g. `"int"`, `"*os.File"`,
+/// `"[]uint8"`, `"map[string]int"`).
+///
+/// `name` is `None` when the descriptor could not be located or carries no
+/// name — callers keep the raw `va` and avoid fabricating a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeRef<'a> {
+    /// Virtual address of the referenced type descriptor.
+    pub va: u64,
+    /// Resolved type display name, if the descriptor was reachable.
+    pub name: Option<&'a str>,
+}
+
 /// One concrete-type method recovered from the [`UncommonType`] method array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodEntry<'a> {
@@ -92,10 +131,18 @@ pub struct MethodEntry<'a> {
     pub name: &'a str,
     /// Type-descriptor offset relative to `moduledata.types` (`mtyp` field).
     pub type_descriptor_offset: i32,
-    /// Text offset relative to `runtime.text` for the direct-call entry, if
-    /// non-zero. `None` for methods only reachable via interface dispatch
-    /// (the linker omits the direct entry when not used).
+    /// Resolved name of the method's signature-type descriptor, if it carries
+    /// one. Usually `None`: Go func types are unnamed, so the *name* is empty —
+    /// resolve [`Self::type_descriptor_offset`] to a [`TypeDetail::Func`]
+    /// (whose params now carry names) for the full signature.
+    pub type_name: Option<&'a str>,
+    /// Text offset relative to `runtime.text` for the direct-call entry
+    /// (`tfn`), if non-zero. `None` for methods only reachable via interface
+    /// dispatch (the linker omits the direct entry when not used).
     pub function_text_offset: Option<i32>,
+    /// Text offset relative to `runtime.text` for the interface-call wrapper
+    /// (`ifn`), if non-zero. `None` when the linker omitted it.
+    pub interface_text_offset: Option<i32>,
     /// Whether the method's name starts with an uppercase letter.
     pub is_exported: bool,
 }
@@ -107,6 +154,11 @@ pub struct StructField<'a> {
     pub name: &'a str,
     /// Virtual address of the field's type descriptor.
     pub type_va: u64,
+    /// Resolved name of the field's type (e.g. `"int"`, `"*bytes.Buffer"`),
+    /// if the descriptor was reachable. `None` when unresolved.
+    pub type_name: Option<&'a str>,
+    /// The field's struct tag (e.g. `json:"id" db:"id"`), if present.
+    pub tag: Option<&'a str>,
     /// Byte offset of the field within the parent struct.
     pub offset: u64,
     /// Whether the field is embedded (anonymous Go field).
@@ -120,6 +172,11 @@ pub struct InterfaceMethod<'a> {
     pub name: &'a str,
     /// Type-descriptor offset relative to `moduledata.types`.
     pub type_descriptor_offset: i32,
+    /// Resolved name of the method's signature-type descriptor, if it carries
+    /// one. Usually `None` (Go func types are unnamed); resolve
+    /// [`Self::type_descriptor_offset`] to a [`TypeDetail::Func`] for the
+    /// full, name-resolved signature.
+    pub type_name: Option<&'a str>,
 }
 
 /// Kind-specific details parsed from Go type descriptors.
@@ -149,6 +206,8 @@ pub enum TypeDetail<'a> {
         len: u64,
         /// Virtual address of the element type descriptor.
         elem_va: u64,
+        /// Virtual address of the corresponding slice type descriptor (`[]T`).
+        slice_va: u64,
     },
     /// Channel type: `chan T`, `<-chan T`, or `chan<- T`.
     Chan {
@@ -165,18 +224,18 @@ pub enum TypeDetail<'a> {
         out_count: u16,
         /// Whether the function is variadic (`...` final param).
         is_variadic: bool,
-        /// Virtual addresses of input parameter type descriptors, in
+        /// Input parameter type references (VA + resolved name), in
         /// declaration order. Length matches [`in_count`] when the descriptor
         /// is well-formed; may be shorter on truncated input.
         ///
         /// [`in_count`]: TypeDetail::Func::in_count
-        inputs: Vec<u64>,
-        /// Virtual addresses of output (return) type descriptors, in
+        inputs: Vec<TypeRef<'a>>,
+        /// Output (return) type references (VA + resolved name), in
         /// declaration order. Length matches [`out_count`] when the
         /// descriptor is well-formed; may be shorter on truncated input.
         ///
         /// [`out_count`]: TypeDetail::Func::out_count
-        outputs: Vec<u64>,
+        outputs: Vec<TypeRef<'a>>,
     },
     /// Interface type: `interface { ... }`.
     Interface {
@@ -185,6 +244,9 @@ pub enum TypeDetail<'a> {
         /// Resolved method names + type offsets (empty if the interface has
         /// no methods, e.g. `interface{}`).
         methods: Vec<InterfaceMethod<'a>>,
+        /// Package import path of the interface type, if named (from the
+        /// interface descriptor's `PkgPath`). `None` for anonymous interfaces.
+        pkg_path: Option<&'a str>,
     },
     /// Map type: `map[K]V`.
     Map {
@@ -192,6 +254,17 @@ pub enum TypeDetail<'a> {
         key_va: u64,
         /// Virtual address of the element (value) type descriptor.
         elem_va: u64,
+        /// Virtual address of the internal bucket/group type descriptor.
+        group_va: u64,
+        /// Virtual address of the key-hashing function.
+        hasher_va: u64,
+        /// Byte stride between keys in a bucket/group.
+        key_stride: u64,
+        /// Byte stride between elements in a bucket/group.
+        elem_stride: u64,
+        /// Map implementation flags (`abi.MapType.Flags` /
+        /// `maptype.flags` — indirect-key/elem, reflexive-key, etc.).
+        flags: u32,
     },
     /// Pointer type: `*T`.
     Pointer {
@@ -477,6 +550,8 @@ pub struct TypeIter<'a> {
     data: &'a [u8],
     types_base_va: u64,
     ps: u8,
+    /// Pre-1.17 (`Go116`) name length encoding (2-byte big-endian vs varint).
+    legacy: bool,
     strategy: TypeIterStrategy<'a>,
 }
 
@@ -496,6 +571,7 @@ impl<'a> TypeIter<'a> {
             data: ctx.structure_search_data(),
             types_base_va: 0,
             ps: 0,
+            legacy: false,
             strategy: TypeIterStrategy::Empty,
         }
     }
@@ -521,8 +597,10 @@ impl<'a> Iterator for TypeIter<'a> {
                         && let Some(go_type) = parse_type_at(
                             self.data,
                             file_off,
+                            type_va,
                             self.types_base_va,
                             self.ps,
+                            self.legacy,
                             self.ctx,
                         )
                     {
@@ -559,10 +637,13 @@ impl<'a> Iterator for TypeIter<'a> {
                         self.data,
                         self.types_base_va,
                         self.ps,
+                        self.legacy,
                         self.ctx,
                     );
+                    let here = *td;
                     *td = td.checked_add(desc_size as u64)?;
-                    if let Some(t) = go_type {
+                    if let Some(mut t) = go_type {
+                        t.descriptor_va = here;
                         return Some(t);
                     }
                     // Else fall through to next iteration.
@@ -577,7 +658,7 @@ impl<'a> Iterator for TypeIter<'a> {
 /// discovery up front (cheap on ELF / Mach-O, scan-based on PE) so each
 /// [`Iterator::next`] call does only the per-type work.
 ///
-/// Strategy selection mirrors the previous eager implementation:
+/// Strategy selection:
 /// 1. Dedicated `.typelink` / `__typelink` section if present.
 /// 2. `moduledata.typelinks` slice (PE / older Go).
 /// 3. Descriptor walk over `[types .. etypes]`.
@@ -602,9 +683,14 @@ pub fn extract_types_iter<'a>(
     let sections = ctx.sections();
     let pv = pclntab_version.unwrap_or(PclntabVersion::Go120);
     let has_typelink = sections.typelink.is_some();
+    // Go ≤1.16 encodes type-name lengths as a 2-byte big-endian uint16; 1.17+
+    // uses a varint. See `name::decode_name`.
+    let legacy = matches!(pv, PclntabVersion::Go116 | PclntabVersion::Go12);
 
-    // Find moduledata: dedicated section, PE pointer-scan, or wasm
-    // linear-memory pointer-scan.
+    // Find moduledata: the dedicated `.go.module` section (Go 1.26+), else a
+    // pointer-scan for its pcHeader pointer. The section is absent on PE, on
+    // wasm, and on ELF / Mach-O before Go 1.26, so the scan is the fallback for
+    // every non-section case.
     let moduledata = if let Some(ref range) = sections.go_module {
         let end = match range.offset.checked_add(range.size) {
             Some(e) => e,
@@ -615,7 +701,7 @@ pub fn extract_types_iter<'a>(
             None => return TypeIter::empty(ctx),
         };
         Moduledata::parse(md_data, ptr_size, pv, has_typelink, go_version_minor)
-    } else if matches!(ctx.format(), BinaryFormat::Pe | BinaryFormat::Wasm) {
+    } else {
         discover_moduledata_via_pcheader(
             ctx,
             ptr_size,
@@ -624,8 +710,6 @@ pub fn extract_types_iter<'a>(
             go_version_minor,
             pclntab_offset,
         )
-    } else {
-        None
     };
 
     let md = match moduledata {
@@ -643,6 +727,7 @@ pub fn extract_types_iter<'a>(
             data,
             types_base_va: md.types,
             ps: ptr_size,
+            legacy,
             strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
         };
     }
@@ -659,6 +744,7 @@ pub fn extract_types_iter<'a>(
             data,
             types_base_va: md.types,
             ps: ptr_size,
+            legacy,
             strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
         };
     }
@@ -671,6 +757,7 @@ pub fn extract_types_iter<'a>(
             data,
             types_base_va: md.types,
             ps: ptr_size,
+            legacy,
             strategy: TypeIterStrategy::Walk {
                 td,
                 etypes_va: md.etypes,
@@ -765,13 +852,180 @@ fn discover_moduledata_via_pcheader(
 fn parse_type_at<'a>(
     data: &'a [u8],
     file_off: usize,
+    type_va: u64,
     types_base_va: u64,
     ps: u8,
+    legacy: bool,
     ctx: &BinaryContext<'a>,
 ) -> Option<GoType<'a>> {
     let remaining = data.get(file_off..)?;
     let abi_type = AbiType::parse(remaining, ps)?;
-    build_go_type(&abi_type, remaining, data, types_base_va, ps, ctx)
+    let mut t = build_go_type(&abi_type, remaining, data, types_base_va, ps, legacy, ctx)?;
+    t.descriptor_va = type_va;
+    Some(t)
+}
+
+/// Parse the type descriptor at virtual address `va` into a [`GoType`].
+pub fn type_at_va<'a>(
+    ctx: &'a BinaryContext<'a>,
+    va: u64,
+    types_base_va: u64,
+    ps: u8,
+    legacy: bool,
+) -> Option<GoType<'a>> {
+    let data = ctx.structure_search_data();
+    let file_off = ctx.va_to_file(va)?;
+    let t = parse_type_at(data, file_off, va, types_base_va, ps, legacy, ctx)?;
+    // Validate this is a real descriptor, not a mid-descriptor / non-type
+    // address a stray reference pointed at: the kind must be known and the
+    // name must be clean (Go type names never contain control characters).
+    if t.kind == TypeKind::Invalid {
+        return None;
+    }
+    if t.name.bytes().any(|b| b < 0x20) {
+        return None;
+    }
+    Some(t)
+}
+
+/// Transitively enumerate every type reachable from `seeds`.
+///
+/// BFS over type-descriptor virtual addresses: each popped VA is parsed
+/// independently (robust — no reliance on descriptor sizing), and all the
+/// types it references are enqueued. Reaches types absent from the seed set
+/// (typically `typelink`), e.g. a struct used only as a pointer's element.
+pub fn extract_all_types<'a>(
+    ctx: &'a BinaryContext<'a>,
+    ptr_size: u8,
+    seeds: Vec<GoType<'a>>,
+    types_base: u64,
+    etypes: u64,
+    legacy: bool,
+) -> Vec<GoType<'a>> {
+    const CAP: usize = 2_000_000;
+    // Every Go type descriptor lives in [types, etypes). Bounding the traversal
+    // to that range keeps the walk from following a stray reference into
+    // non-type data and parsing cascading garbage.
+    let in_range = |va: u64| va >= types_base && (etypes == 0 || va < etypes);
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut queue: VecDeque<u64> = VecDeque::new();
+    let mut out: Vec<GoType<'a>> = Vec::new();
+    for t in &seeds {
+        if in_range(t.descriptor_va) {
+            queue.push_back(t.descriptor_va);
+        }
+    }
+    while let Some(va) = queue.pop_front() {
+        if out.len() >= CAP {
+            break;
+        }
+        if !in_range(va) || !visited.insert(va) {
+            continue;
+        }
+        let t = match type_at_va(ctx, va, types_base, ptr_size, legacy) {
+            Some(t) => t,
+            None => continue,
+        };
+        collect_type_refs(&t, types_base, |r| {
+            if in_range(r) && !visited.contains(&r) {
+                queue.push_back(r);
+            }
+        });
+        out.push(t);
+    }
+    out
+}
+
+/// Invoke `push` with the VA of every type descriptor `t` references.
+fn collect_type_refs(t: &GoType<'_>, types_base: u64, mut push: impl FnMut(u64)) {
+    let off_to_va = |off: i32| (types_base as i64).saturating_add(off as i64) as u64;
+    if t.ptr_to_this != 0 {
+        push(off_to_va(t.ptr_to_this));
+    }
+    match &t.detail {
+        TypeDetail::Array { elem_va, .. }
+        | TypeDetail::Chan { elem_va, .. }
+        | TypeDetail::Pointer { elem_va }
+        | TypeDetail::Slice { elem_va } => push(*elem_va),
+        TypeDetail::Map {
+            key_va,
+            elem_va,
+            group_va,
+            ..
+        } => {
+            push(*key_va);
+            push(*elem_va);
+            push(*group_va);
+        }
+        TypeDetail::Struct { fields, .. } => {
+            for f in fields {
+                push(f.type_va);
+            }
+        }
+        TypeDetail::Func {
+            inputs, outputs, ..
+        } => {
+            for r in inputs.iter().chain(outputs.iter()) {
+                push(r.va);
+            }
+        }
+        TypeDetail::Interface { methods, .. } => {
+            for m in methods {
+                push(off_to_va(m.type_descriptor_offset));
+            }
+        }
+        TypeDetail::None => {}
+    }
+    for m in &t.methods {
+        if m.type_descriptor_offset != 0 {
+            push(off_to_va(m.type_descriptor_offset));
+        }
+    }
+}
+
+/// Resolve a Go encoded name located at virtual address `va` to a string.
+fn resolve_name_at_va<'a>(
+    va: u64,
+    full_data: &'a [u8],
+    legacy: bool,
+    ctx: &BinaryContext<'a>,
+) -> Option<&'a str> {
+    if va == 0 {
+        return None;
+    }
+    ctx.va_to_file(va)
+        .and_then(|o| full_data.get(o..))
+        .and_then(|d| decode_name(d, legacy))
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve a referenced type descriptor at `type_va` to its display name.
+///
+/// Parses the `abi.Type` at the target VA and decodes its `Str` (a NameOff
+/// relative to `types_base_va`). One level deep only — Go already stores
+/// constructed names like `[]uint8` / `map[string]int` in `Str` for composite
+/// types, so this yields a usable label without reimplementing the runtime's
+/// recursive type formatter. Returns `None` (rather than guessing) when the
+/// descriptor is unreachable or unnamed.
+fn resolve_type_name<'a>(
+    type_va: u64,
+    full_data: &'a [u8],
+    types_base_va: u64,
+    ps: u8,
+    legacy: bool,
+    ctx: &BinaryContext<'a>,
+) -> Option<&'a str> {
+    if type_va == 0 {
+        return None;
+    }
+    let off = ctx.va_to_file(type_va)?;
+    let abi = AbiType::parse(full_data.get(off..)?, ps)?;
+    let name_va = (types_base_va as i64).saturating_add(abi.str_off as i64) as u64;
+    let name = ctx
+        .va_to_file(name_va)
+        .and_then(|o| full_data.get(o..))
+        .and_then(|d| decode_name(d, legacy))?;
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Build a `GoType` from a parsed `AbiType` by resolving its name and
@@ -782,6 +1036,7 @@ fn build_go_type<'a>(
     full_data: &'a [u8],
     types_base_va: u64,
     ps: u8,
+    legacy: bool,
     ctx: &BinaryContext<'a>,
 ) -> Option<GoType<'a>> {
     let kind = TypeKind::from_raw(abi_type.kind());
@@ -791,7 +1046,7 @@ fn build_go_type<'a>(
     let name: &'a str = ctx
         .va_to_file(name_va)
         .and_then(|off| full_data.get(off..))
-        .and_then(decode_name)
+        .and_then(|d| decode_name(d, legacy))
         .unwrap_or("");
 
     if name.is_empty() && kind == TypeKind::Invalid {
@@ -817,6 +1072,7 @@ fn build_go_type<'a>(
             .map(|a| TypeDetail::Array {
                 len: a.len,
                 elem_va: a.elem,
+                slice_va: a.slice,
             })
             .unwrap_or(TypeDetail::None),
         TypeKind::Chan => type_data
@@ -831,8 +1087,17 @@ fn build_go_type<'a>(
             .get(base_sz..)
             .and_then(FuncTypeExtra::parse)
             .map(|f| {
-                let (inputs, outputs) =
-                    read_func_params(type_data, base_sz, f.in_count, f.num_out(), ps);
+                let (inputs, outputs) = read_func_params(
+                    type_data,
+                    base_sz,
+                    f.in_count,
+                    f.num_out(),
+                    ps,
+                    legacy,
+                    full_data,
+                    types_base_va,
+                    ctx,
+                );
                 TypeDetail::Func {
                     in_count: f.in_count,
                     out_count: f.num_out(),
@@ -846,10 +1111,13 @@ fn build_go_type<'a>(
             .get(base_sz..)
             .and_then(|d| InterfaceTypeExtra::parse(d, ps))
             .map(|i| {
-                let methods = resolve_interface_methods(&i, full_data, types_base_va, ctx);
+                let methods =
+                    resolve_interface_methods(&i, full_data, types_base_va, ps, legacy, ctx);
+                let pkg_path = resolve_name_at_va(i.pkg_path, full_data, legacy, ctx);
                 TypeDetail::Interface {
                     method_count: i.methods.len,
                     methods,
+                    pkg_path,
                 }
             })
             .unwrap_or(TypeDetail::None),
@@ -859,6 +1127,11 @@ fn build_go_type<'a>(
             .map(|m| TypeDetail::Map {
                 key_va: m.key,
                 elem_va: m.elem,
+                group_va: m.group,
+                hasher_va: m.hasher,
+                key_stride: m.key_stride,
+                elem_stride: m.elem_stride,
+                flags: m.flags,
             })
             .unwrap_or(TypeDetail::None),
         TypeKind::Pointer => type_data
@@ -875,7 +1148,7 @@ fn build_go_type<'a>(
             .get(base_sz..)
             .and_then(|d| StructTypeExtra::parse(d, ps))
             .map(|s| {
-                let fields = resolve_struct_fields(&s, full_data, ps, ctx);
+                let fields = resolve_struct_fields(&s, full_data, types_base_va, ps, legacy, ctx);
                 TypeDetail::Struct {
                     field_count: s.fields.len,
                     fields,
@@ -886,7 +1159,7 @@ fn build_go_type<'a>(
     };
 
     // Parse UncommonType for method counts and (optionally) method list.
-    let (method_count, exported_method_count, methods) = if abi_type.has_uncommon() {
+    let (method_count, exported_method_count, methods, pkg_path) = if abi_type.has_uncommon() {
         let extra = match kind {
             TypeKind::Array => ArrayTypeExtra::size(ps),
             TypeKind::Chan => ChanTypeExtra::size(ps),
@@ -906,17 +1179,31 @@ fn build_go_type<'a>(
                     concrete_sz,
                     full_data,
                     types_base_va,
+                    ps,
+                    legacy,
                     ctx,
                 );
-                (u.mcount, u.xcount, methods)
+                // pkg_path is a NameOff (relative to types base) into the names
+                // table; 0 means "no package path".
+                let pkg_path = if u.pkg_path != 0 {
+                    let name_va = (types_base_va as i64).saturating_add(u.pkg_path as i64) as u64;
+                    ctx.va_to_file(name_va)
+                        .and_then(|o| full_data.get(o..))
+                        .and_then(|d| decode_name(d, legacy))
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+                (u.mcount, u.xcount, methods, pkg_path)
             }
-            None => (0, 0, Vec::new()),
+            None => (0, 0, Vec::new(), None),
         }
     } else {
-        (0, 0, Vec::new())
+        (0, 0, Vec::new(), None)
     };
 
     Some(GoType {
+        descriptor_va: 0, // set by the caller, which knows the type's VA
         name,
         kind,
         size: abi_type.size_,
@@ -924,6 +1211,11 @@ fn build_go_type<'a>(
         field_align: abi_type.field_align_,
         ptr_bytes: abi_type.ptr_bytes,
         hash: abi_type.hash,
+        tflag: abi_type.tflag,
+        ptr_to_this: abi_type.ptr_to_this,
+        equal_va: abi_type.equal,
+        gcdata_va: abi_type.gcdata,
+        pkg_path,
         has_uncommon: abi_type.has_uncommon(),
         is_named: abi_type.is_named(),
         is_exported,
@@ -949,15 +1241,18 @@ fn build_go_type<'a>(
 ///
 /// Returns `(inputs, outputs)`. Lengths may be shorter than the requested
 /// counts on truncated input — callers should treat that as malformed.
-fn read_func_params(
-    type_data: &[u8],
+#[allow(clippy::too_many_arguments)]
+fn read_func_params<'a>(
+    type_data: &'a [u8],
     base_sz: usize,
     in_count: u16,
     out_count: u16,
     ps: u8,
-) -> (Vec<u64>, Vec<u64>) {
-    use crate::structures::util::{align_up, read_uintptr};
-
+    legacy: bool,
+    full_data: &'a [u8],
+    types_base_va: u64,
+    ctx: &BinaryContext<'a>,
+) -> (Vec<TypeRef<'a>>, Vec<TypeRef<'a>>) {
     let p = ps as usize;
     if p == 0 {
         return (Vec::new(), Vec::new());
@@ -971,9 +1266,11 @@ fn read_func_params(
         None => return (Vec::new(), Vec::new()),
     };
 
-    let read_one = |idx: usize| -> Option<u64> {
+    let read_one = |idx: usize| -> Option<TypeRef<'a>> {
         let pos = params_off.checked_add(idx.checked_mul(p)?)?;
-        read_uintptr(type_data, pos, ps)
+        let va = read_uintptr(type_data, pos, ps)?;
+        let name = resolve_type_name(va, full_data, types_base_va, ps, legacy, ctx);
+        Some(TypeRef { va, name })
     };
 
     let mut inputs = Vec::with_capacity(in_count as usize);
@@ -997,12 +1294,15 @@ fn read_func_params(
     (inputs, outputs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_concrete_methods<'a>(
     uncommon: &UncommonType,
     type_data: &'a [u8],
     uncommon_off_in_type: usize,
     full_data: &'a [u8],
     types_base_va: u64,
+    ps: u8,
+    legacy: bool,
     ctx: &BinaryContext<'a>,
 ) -> Vec<MethodEntry<'a>> {
     let mcount = uncommon.mcount as usize;
@@ -1013,7 +1313,7 @@ fn resolve_concrete_methods<'a>(
         Some(s) => s,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(mcount);
+    let mut out = Vec::with_capacity(mcount.min(4096));
     for i in 0..mcount {
         let off = match i
             .checked_mul(GoMethod::SIZE)
@@ -1030,15 +1330,22 @@ fn resolve_concrete_methods<'a>(
         let (name, flags): (&'a str, u8) = ctx
             .va_to_file(name_va)
             .and_then(|o| full_data.get(o..))
-            .and_then(decode_name_with_flags)
+            .and_then(|d| decode_name_with_flags(d, legacy))
             .unwrap_or(("", 0));
         let is_exported = (flags & NAME_FLAG_EXPORTED) != 0
             || name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-        let function_text_offset = if m.tfn != 0 { Some(m.tfn) } else { None };
+        // `tfn`/`ifn` are `textOff`s; the linker writes `-1` when the method
+        // has no generated body, so only positive offsets are real entries.
+        let function_text_offset = if m.tfn > 0 { Some(m.tfn) } else { None };
+        let interface_text_offset = if m.ifn > 0 { Some(m.ifn) } else { None };
+        let type_va = (types_base_va as i64).saturating_add(m.mtyp as i64) as u64;
+        let type_name = resolve_type_name(type_va, full_data, types_base_va, ps, legacy, ctx);
         out.push(MethodEntry {
             name,
             type_descriptor_offset: m.mtyp,
+            type_name,
             function_text_offset,
+            interface_text_offset,
             is_exported,
         });
     }
@@ -1050,6 +1357,8 @@ fn resolve_interface_methods<'a>(
     iface: &InterfaceTypeExtra,
     full_data: &'a [u8],
     types_base_va: u64,
+    ps: u8,
+    legacy: bool,
     ctx: &BinaryContext<'a>,
 ) -> Vec<InterfaceMethod<'a>> {
     let count = iface.methods.len as usize;
@@ -1064,7 +1373,7 @@ fn resolve_interface_methods<'a>(
         Some(b) => b,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(4096));
     for i in 0..count {
         let off = match i.checked_mul(GoImethod::SIZE) {
             Some(o) => o,
@@ -1078,11 +1387,14 @@ fn resolve_interface_methods<'a>(
         let name: &'a str = ctx
             .va_to_file(name_va)
             .and_then(|o| full_data.get(o..))
-            .and_then(decode_name)
+            .and_then(|d| decode_name(d, legacy))
             .unwrap_or("");
+        let type_va = (types_base_va as i64).saturating_add(im.typ as i64) as u64;
+        let type_name = resolve_type_name(type_va, full_data, types_base_va, ps, legacy, ctx);
         out.push(InterfaceMethod {
             name,
             type_descriptor_offset: im.typ,
+            type_name,
         });
     }
     out
@@ -1092,7 +1404,9 @@ fn resolve_interface_methods<'a>(
 fn resolve_struct_fields<'a>(
     extra: &StructTypeExtra,
     full_data: &'a [u8],
+    types_base_va: u64,
     ps: u8,
+    legacy: bool,
     ctx: &BinaryContext<'a>,
 ) -> Vec<StructField<'a>> {
     let count = extra.fields.len as usize;
@@ -1108,7 +1422,7 @@ fn resolve_struct_fields<'a>(
         None => return Vec::new(),
     };
     let stride = GoStructField::size(ps);
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(4096));
     for i in 0..count {
         let off = match i.checked_mul(stride) {
             Some(o) => o,
@@ -1118,15 +1432,18 @@ fn resolve_struct_fields<'a>(
             Some(f) => f,
             None => break,
         };
-        let (name, flags): (&'a str, u8) = ctx
+        let (name, flags, tag): (&'a str, u8, Option<&'a str>) = ctx
             .va_to_file(f.name)
             .and_then(|o| full_data.get(o..))
-            .and_then(decode_name_with_flags)
-            .unwrap_or(("", 0));
+            .and_then(|d| decode_name_and_tag(d, legacy))
+            .unwrap_or(("", 0, None));
         let is_embedded = (flags & NAME_FLAG_EMBEDDED) != 0;
+        let type_name = resolve_type_name(f.typ, full_data, types_base_va, ps, legacy, ctx);
         out.push(StructField {
             name,
             type_va: f.typ,
+            type_name,
+            tag,
             offset: f.offset,
             is_embedded,
         });

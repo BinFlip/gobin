@@ -82,15 +82,20 @@ pub mod structures;
 
 use crate::{
     detection::{
-        Confidence, ConfidenceReport, ConfidenceSignal, ParseError, VersionSource, heuristic_hits,
+        Confidence, ConfidenceReport, ConfidenceSignal, ParseError, VersionSource, find_bytes,
+        heuristic_hits,
     },
     formats::{BinaryContext, BinaryFormat},
-    metadata::{BuildInfo, Compiler, FunctionIter, ObfuscationKind},
+    metadata::{BuildInfo, Compiler, FipsInfo, FunctionIter, InitFunc, InitTask, ObfuscationKind},
     structures::{
-        buildid, buildinfo, inline, itab,
-        moduledata::Moduledata,
+        Arch, PclntabVersion, buildid, buildinfo, embed, gcprog,
+        goslice::{GoSlice, GoStr},
+        inittask, inline, itab,
+        moduledata::{ModuleHash, Moduledata, PtabEntry, TextSect},
+        name::decode_name,
         pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
         strings as gostrings, types,
+        util::read_i32,
     },
 };
 
@@ -356,6 +361,50 @@ impl<'a> GoBinary<'a> {
         self.moduledata.as_ref()
     }
 
+    /// All modules in the `moduledata` linked list, starting from the first.
+    ///
+    /// The runtime links one `moduledata` per loaded module (the main binary
+    /// plus any plugins / shared libraries) via the `next` field. **That field
+    /// is populated at load time**, so in a static on-disk binary it is almost
+    /// always nil and this returns a single entry — the chain is followed
+    /// defensively (with a cycle guard) for the rare multi-module image and so
+    /// plugin/shared objects analyzed on their own parse correctly. Empty if
+    /// the binary has no locatable moduledata.
+    pub fn modules(&self) -> Vec<Moduledata> {
+        const MAX_MODULES: usize = 1024;
+        let mut out = Vec::new();
+        let first = match self.moduledata.clone() {
+            Some(m) => m,
+            None => return out,
+        };
+        let mut next_va = first.next;
+        let mut seen: Vec<u64> = vec![first.pc_header];
+        out.push(first);
+        while next_va != 0 && out.len() < MAX_MODULES {
+            if seen.contains(&next_va) {
+                break; // cycle guard
+            }
+            seen.push(next_va);
+            let md = match self.parse_moduledata_at(next_va) {
+                Some(m) => m,
+                None => break,
+            };
+            next_va = md.next;
+            out.push(md);
+        }
+        out
+    }
+
+    /// Parse a `moduledata` located at virtual address `va` (used to follow the
+    /// `next` chain), reusing this binary's pclntab version and Go version.
+    fn parse_moduledata_at(&self, va: u64) -> Option<Moduledata> {
+        let meta = self.pclntab_meta?;
+        let bytes = self.ctx.slice_at_va(va)?;
+        let has_typelink = self.ctx.sections().typelink.is_some();
+        let go_minor = self.go_version.and_then(parse_go_minor_version);
+        Moduledata::parse(bytes, meta.ptr_size, meta.version, has_typelink, go_minor)
+    }
+
     /// Virtual address of `runtime.text` — the first byte of Go-emitted code.
     ///
     /// `entry_off` on each [`FuncData`] is measured relative to this address.
@@ -401,6 +450,178 @@ impl<'a> GoBinary<'a> {
         self.moduledata.as_ref().map(|m| m.etext)
     }
 
+    /// Whether this module contains the program's `main` — true for the main
+    /// executable, false for a plugin / shared library.
+    ///
+    /// Read from `moduledata.hasmain`. `None` if moduledata is unavailable.
+    pub fn is_main_module(&self) -> Option<bool> {
+        self.moduledata.as_ref().map(|m| m.has_main)
+    }
+
+    /// Pointer map of the initialized data segment (`[data, edata)`) — which
+    /// pointer-sized words hold pointers, decoded from the `gcdata` GC program.
+    ///
+    /// This is the precise location of every pointer in global initialized
+    /// memory (function pointers, `itab`/interface pointers, string/slice
+    /// headers, global `*T` variables) — recoverable without disassembly.
+    /// `None` if moduledata / the GC data is unavailable.
+    pub fn data_pointer_map(&self) -> Option<gcprog::PointerMap> {
+        let md = self.moduledata.as_ref()?;
+        self.pointer_map(md.gcdata, md.data)
+    }
+
+    /// Pointer map of the bss segment (`[bss, ebss)`), decoded from the
+    /// `gcbss` GC program. See [`Self::data_pointer_map`].
+    pub fn bss_pointer_map(&self) -> Option<gcprog::PointerMap> {
+        let md = self.moduledata.as_ref()?;
+        self.pointer_map(md.gcbss, md.bss)
+    }
+
+    /// Decode a GC program at `prog_va` into a [`gcprog::PointerMap`] over
+    /// `segment` (`[start, end)`).
+    fn pointer_map(
+        &self,
+        prog_va: u64,
+        segment: structures::moduledata::VaRange,
+    ) -> Option<gcprog::PointerMap> {
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        if ptr_size == 0 || prog_va == 0 || segment.is_empty() {
+            return None;
+        }
+        let max_words = usize::try_from(segment.size().checked_div(u64::from(ptr_size))?).ok()?;
+        let prog = self.ctx.slice_at_va(prog_va)?;
+        let words = gcprog::run_gc_prog(prog, max_words);
+        Some(gcprog::PointerMap {
+            base_va: segment.start,
+            ptr_size,
+            words,
+        })
+    }
+
+    /// The module name (`moduledata.modulename`), set for plugins / shared
+    /// libraries. `None` for an ordinary executable (where it is empty) or
+    /// when moduledata is unavailable.
+    pub fn module_name(&self) -> Option<&str> {
+        self.resolve_go_str(self.moduledata.as_ref()?.modulename)
+    }
+
+    /// The plugin path (`moduledata.pluginpath`), set only for
+    /// `-buildmode=plugin`. `None` otherwise.
+    pub fn plugin_path(&self) -> Option<&str> {
+        self.resolve_go_str(self.moduledata.as_ref()?.pluginpath)
+    }
+
+    /// Whether the binary was built with coverage instrumentation
+    /// (`-cover`) — detected via a non-empty `moduledata` coverage-counter
+    /// region. Always `false` for Go < 1.20 (the region did not exist).
+    pub fn is_coverage_build(&self) -> bool {
+        self.moduledata
+            .as_ref()
+            .and_then(|m| m.covctrs)
+            .is_some_and(|r| !r.is_empty())
+    }
+
+    /// Resolve a [`GoStr`] header to a borrowed `&str` via the address space.
+    /// Returns `None` for empty, unmapped, or non-UTF-8 strings.
+    fn resolve_go_str(&self, s: GoStr) -> Option<&str> {
+        if s.is_empty() {
+            return None;
+        }
+        let bytes = self.ctx.slice_at_va(s.ptr)?.get(..s.len as usize)?;
+        std::str::from_utf8(bytes).ok()
+    }
+
+    /// Text sub-sections from `moduledata.textsectmap`. A single entry for an
+    /// ordinary binary; multiple only when the linker split a large binary's
+    /// code across several text sections.
+    pub fn text_sections(&self) -> Vec<TextSect> {
+        let md = match self.moduledata.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let ps = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        decode_slice(&self.ctx, &md.textsectmap, ps, TextSect::size(ps), |buf| {
+            TextSect::parse(buf, 0, ps)
+        })
+    }
+
+    /// Exported plugin symbols from `moduledata.ptab`. Empty for non-plugin
+    /// builds (`-buildmode=plugin` only).
+    pub fn plugin_exports(&self) -> Vec<PtabEntry<'_>> {
+        let md = match self.moduledata.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let ps = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        let types_base = md.types;
+        let legacy = self.legacy_names();
+        decode_slice(&self.ctx, &md.ptab, ps, 8, |buf| {
+            let name_off = read_i32(buf, 0)?;
+            let type_offset = read_i32(buf, 4)?;
+            let name = self.resolve_name_off(types_base, name_off, legacy);
+            Some(PtabEntry { name, type_offset })
+        })
+    }
+
+    /// Per-package ABI hashes from `moduledata.pkghashes` (imported-package
+    /// hashes). Populated only for plugin / shared builds. See also
+    /// [`Self::module_hashes`].
+    pub fn package_hashes(&self) -> Vec<ModuleHash<'_>> {
+        let md = match self.moduledata.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        self.decode_module_hashes(&md.pkghashes)
+    }
+
+    /// Dependency module ABI hashes from `moduledata.modulehashes`. Populated
+    /// only for plugin / shared builds.
+    pub fn module_hashes(&self) -> Vec<ModuleHash<'_>> {
+        let md = match self.moduledata.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        self.decode_module_hashes(&md.modulehashes)
+    }
+
+    /// Decodes a `[]modulehash` slice (`pkghashes` or `modulehashes`) into
+    /// resolved [`ModuleHash`] entries.
+    fn decode_module_hashes(&self, slice: &GoSlice) -> Vec<ModuleHash<'_>> {
+        let ps = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        if ps == 0 {
+            return Vec::new();
+        }
+        // modulehash = { modulename string; linktimehash string; runtimehash *string }
+        let entry_size = (ps as usize).saturating_mul(5);
+        let p = ps as usize;
+        decode_slice(&self.ctx, slice, ps, entry_size, |buf| {
+            let module_name = GoStr::parse(buf, 0, ps).and_then(|s| self.resolve_go_str(s));
+            let linktime_hash =
+                GoStr::parse(buf, p.checked_mul(2)?, ps).and_then(|s| self.resolve_go_str(s));
+            Some(ModuleHash {
+                module_name,
+                linktime_hash,
+            })
+        })
+    }
+
+    /// Whether this binary uses the pre-1.17 (`Go116`) type-name encoding.
+    fn legacy_names(&self) -> bool {
+        self.pclntab_meta
+            .map(|m| matches!(m.version, PclntabVersion::Go116 | PclntabVersion::Go12))
+            .unwrap_or(false)
+    }
+
+    /// Resolve a `NameOff` (relative to `moduledata.types`) to a name string.
+    fn resolve_name_off(&self, types_base: u64, name_off: i32, legacy: bool) -> Option<&str> {
+        if name_off == 0 {
+            return None;
+        }
+        let name_va = (types_base as i64).saturating_add(name_off as i64) as u64;
+        let bytes = self.ctx.slice_at_va(name_va)?;
+        decode_name(bytes, legacy).filter(|s| !s.is_empty())
+    }
+
     /// Target architecture, disambiguated using the binary container format.
     ///
     /// [`ParsedPclntab::arch`] derives the arch purely from `(minLC, ptrSize)`
@@ -412,8 +633,7 @@ impl<'a> GoBinary<'a> {
     /// - Other formats defer to the pclntab-derived arch.
     /// - When no pclntab is available, falls back to the build-info
     ///   `GOARCH` setting if present, or [`structures::Arch::Unknown`].
-    pub fn arch(&self) -> structures::Arch {
-        use structures::Arch;
+    pub fn arch(&self) -> Arch {
         if self.ctx.format() == BinaryFormat::Wasm {
             return Arch::Wasm;
         }
@@ -546,22 +766,138 @@ impl<'a> GoBinary<'a> {
         None
     }
 
+    /// FIPS-140 build info, if the binary was compiled in FIPS mode
+    /// (`GOFIPS140=…`, Go 1.24+).
+    ///
+    /// FIPS-140 mode info, if the binary was built with `GOFIPS140` (Go 1.24+).
+    ///
+    /// The decision is driven by the authoritative `GOFIPS140` build setting,
+    /// not the `__go_fipsinfo` section (which is linked into every
+    /// crypto-using binary regardless of FIPS mode). The section's integrity
+    /// sum is folded in as a supplementary content id when present. Returns
+    /// `None` for non-FIPS builds and when build info is unavailable
+    /// (e.g. stripped by `garble`).
+    pub fn fips_info(&self) -> Option<FipsInfo<'a>> {
+        let info = self.build_info.as_ref()?;
+        let version = info.setting("GOFIPS140")?;
+        let enforced_by_default = info
+            .setting("DefaultGODEBUG")
+            .is_some_and(|v| v.split(',').any(|kv| kv == "fips140=on"));
+        let module_sum = self.fips_module_sum();
+        Some(FipsInfo {
+            version,
+            enforced_by_default,
+            module_sum,
+        })
+    }
+
+    /// The raw 32-byte integrity sum from `__go_fipsinfo`, independent of FIPS
+    /// mode. Present in every crypto-linked Go 1.24+ binary; `None` if the
+    /// section is missing or lacks the expected `go:fipsinfo` magic.
+    fn fips_module_sum(&self) -> Option<[u8; 32]> {
+        // go:fipsinfo := struct { Magic [16]byte; Sum [32]byte }
+        const EXPECTED_MAGIC: &[u8; 16] = b"\xff Go fipsinfo \xff\x00";
+        let range = self.ctx.sections().fipsinfo.as_ref()?;
+        let data = self.ctx.section_data(range)?;
+        if data.get(0..16)? != EXPECTED_MAGIC.as_slice() {
+            return None;
+        }
+        let mut sum = [0u8; 32];
+        sum.copy_from_slice(data.get(16..48)?);
+        Some(sum)
+    }
+
+    /// Assets embedded via `//go:embed` into an `embed.FS`.
+    ///
+    /// Locates the generated `[]file` arrays by scanning for their slice
+    /// headers and decodes each entry into its virtual path, directory flag,
+    /// and backing bytes (borrowed from read-only data). Works on stripped
+    /// binaries. Returns an empty `Vec` when the binary embeds nothing.
+    ///
+    /// Only the multi-file `embed.FS` form is recovered — the single-file
+    /// `//go:embed` string/`[]byte` forms compile to plain variables with no
+    /// recognizable anchor and are not surfaced. This is the path Visus uses
+    /// to recurse embedded dropper payloads out of Go binaries.
+    pub fn embedded_assets(&self) -> Vec<embed::EmbeddedAsset<'_>> {
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        if ptr_size == 0 {
+            return Vec::new();
+        }
+        embed::extract(&self.ctx, ptr_size)
+    }
+
+    /// Package initialization order, decoded from `moduledata.inittasks`
+    /// (Go 1.24+).
+    ///
+    /// Returns one [`InitTask`] per linker-built init task, each carrying its
+    /// ordered init functions (entry VA + resolved name). Empty when the
+    /// binary predates Go 1.24, lacks moduledata, or carries no init tasks.
+    ///
+    /// Init order reveals which packages run setup code at startup and in what
+    /// sequence — a useful lens on staging / persistence behaviour.
+    pub fn init_order(&self) -> Vec<InitTask<'_>> {
+        let md = match self.moduledata.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        let raw = inittask::decode(&self.ctx, md, ptr_size);
+        if raw.is_empty() {
+            return Vec::new();
+        }
+
+        // One pass over the function table to map entry-offset -> name, so each
+        // init PC resolves without an O(nfunc) rescan per function.
+        let text_va = self.text_va();
+        let mut names: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+        for f in self.functions() {
+            names.entry(f.entry_offset).or_insert(f.name);
+        }
+
+        let resolve = |pc_va: u64| -> Option<&str> {
+            let off = pc_va.checked_sub(text_va?)?;
+            let off = u32::try_from(off).ok()?;
+            names.get(&off).copied()
+        };
+
+        raw.into_iter()
+            .map(|pcs| {
+                let functions: Vec<InitFunc<'_>> = pcs
+                    .into_iter()
+                    .map(|pc| InitFunc {
+                        entry_va: pc,
+                        name: resolve(pc),
+                    })
+                    .collect();
+                let package = functions
+                    .iter()
+                    .find_map(|f| f.name)
+                    .and_then(metadata::package_of);
+                InitTask { package, functions }
+            })
+            .collect()
+    }
+
     /// All `(interface, concrete type)` pairs the linker proved at build time.
     ///
     /// Decoded from the `.itablink` / `__itablink` section if present, falling
-    /// back to `moduledata.itablinks`. Returns an empty `Vec` when neither
-    /// source is available (heavily stripped binaries, future Go versions
-    /// that drop itablinks).
+    /// back to `moduledata.itablinks` (Go ≤1.26) or the inline itab region at
+    /// `types+itaboffset` (Go 1.27+ / V5). Returns an empty iterator when no
+    /// source is available (heavily stripped binaries).
     ///
     /// Useful for "what implements `io.Reader` in this binary?" queries —
     /// pair with [`Self::types`] to resolve each VA back to a named type.
     pub fn itab_pairs(&self) -> itab::ItabIter<'_> {
         let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
-        let itablinks = self
-            .moduledata
-            .as_ref()
-            .and_then(|md| md.itablinks.as_ref());
-        itab::extract_iter(&self.ctx, ptr_size, itablinks)
+        itab::extract_iter(&self.ctx, ptr_size, self.moduledata.as_ref())
+    }
+
+    /// The `Fun[]` method-pointer array of an itab — the concrete-type methods
+    /// bound to each interface method, in interface order (a `0` entry means
+    /// the method is unbound). Pair with [`Self::itab_pairs`].
+    pub fn itab_methods(&self, pair: &itab::ItabPair) -> Vec<u64> {
+        let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
+        itab::itab_methods(&self.ctx, pair, ptr_size)
     }
 
     /// Whether the binary's pclntab references any cgo-related runtime
@@ -616,6 +952,54 @@ impl<'a> GoBinary<'a> {
         )
     }
 
+    /// Parse the type descriptor at a specific virtual address into a
+    /// [`types::GoType`].
+    ///
+    /// Resolves the `elem_va` / `type_va` / `key_va` references that other
+    /// types carry (e.g. a slice's element type, a struct field's type) into a
+    /// full type. Returns `None` if `va` does not point at a parseable
+    /// descriptor.
+    pub fn type_at(&self, va: u64) -> Option<types::GoType<'_>> {
+        let meta = self.pclntab_meta?;
+        let types_base = self.moduledata.as_ref()?.types;
+        types::type_at_va(
+            &self.ctx,
+            va,
+            types_base,
+            meta.ptr_size,
+            self.legacy_names(),
+        )
+    }
+
+    /// Enumerate **every** reachable type descriptor, not just the
+    /// reflection-registered `typelink` set returned by [`Self::types`].
+    ///
+    /// Seeds from `typelink` and transitively follows every referenced type
+    /// (pointer/slice/array/chan elements, map key/value, struct field types,
+    /// func parameter/result types, method signatures, and each type's
+    /// pointer-to-this), parsing each descriptor independently by virtual
+    /// address. This reaches types absent from `typelink` — e.g. a struct type
+    /// used only as a pointer's element, together with its field tags. Capped
+    /// to bound pathological graphs.
+    pub fn all_types(&self) -> Vec<types::GoType<'_>> {
+        let meta = match self.pclntab_meta {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let (types_base, etypes) = match self.moduledata.as_ref() {
+            Some(m) => (m.types, m.etypes),
+            None => return Vec::new(),
+        };
+        types::extract_all_types(
+            &self.ctx,
+            meta.ptr_size,
+            self.types().collect(),
+            types_base,
+            etypes,
+            self.legacy_names(),
+        )
+    }
+
     /// Streaming iterator over Go string literals discovered by scanning the
     /// binary for `(ptr, len)` headers that resolve to in-binary UTF-8 bytes.
     ///
@@ -656,7 +1040,6 @@ impl<'a> GoBinary<'a> {
 /// has been wiped). False positives are unlikely — these magic byte sequences
 /// don't naturally appear in non-Go binaries.
 pub fn detect(data: &[u8]) -> bool {
-    use crate::detection::find_bytes;
     if find_bytes(data, b"\xff Go buildinf:").is_some() {
         return true;
     }
@@ -753,20 +1136,64 @@ fn is_garble_token(pkg: &str) -> bool {
 }
 
 /// Parse the minor version from a Go version string like `"go1.26.1"` -> `26`.
+/// Decode the fixed-size entries of a moduledata slice `(ptr, len)` by reading
+/// the array at `slice.ptr` and applying `parse` to each `entry_size`-byte
+/// window. Bounds- and count-capped; never panics on malformed input.
+fn decode_slice<T>(
+    ctx: &BinaryContext<'_>,
+    slice: &structures::goslice::GoSlice,
+    ps: u8,
+    entry_size: usize,
+    mut parse: impl FnMut(&[u8]) -> Option<T>,
+) -> Vec<T> {
+    const MAX_ENTRIES: u64 = 10_000_000;
+    if ps == 0 || entry_size == 0 || slice.len == 0 || slice.len > MAX_ENTRIES {
+        return Vec::new();
+    }
+    let arr = match ctx.slice_at_va(slice.ptr) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let n = slice.len as usize;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for i in 0..n {
+        let off = match i.checked_mul(entry_size) {
+            Some(o) => o,
+            None => break,
+        };
+        let end = match off.checked_add(entry_size) {
+            Some(e) => e,
+            None => break,
+        };
+        let buf = match arr.get(off..end) {
+            Some(b) => b,
+            None => break,
+        };
+        if let Some(item) = parse(buf) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 fn parse_go_minor_version(version: &str) -> Option<u32> {
     let rest = version.strip_prefix("go1.")?;
-    let minor_str = rest.split('.').next()?;
+    // Take the leading run of digits so pre-release strings parse too:
+    // `go1.27.4` -> 27, `go1.27rc1` -> 27, `go1.27-devel_abc1234` -> 27.
+    let minor_str = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|s| !s.is_empty())?;
     minor_str.parse().ok()
 }
 
 /// Locate and parse the moduledata for accessor-only use (text/etext/types
 /// region addresses).
 ///
-/// Mirrors the moduledata-finding strategies in
-/// [`crate::structures::types::extract_types`]: prefer the dedicated
-/// `.go.module` section, fall back to PE pointer-scan discovery. Returns
-/// `None` if the binary lacks VA mappings or moduledata can't be located —
-/// callers degrade gracefully (the affected accessors return `None`).
+/// Prefer the dedicated `.go.module` section (Go 1.26+); otherwise scan for
+/// moduledata via its pcHeader pointer (PE, and ELF / Mach-O before Go 1.26).
+/// Returns `None` if the binary lacks VA mappings or moduledata can't be
+/// located — callers degrade gracefully (the affected accessors return `None`).
 fn find_moduledata(
     ctx: &BinaryContext<'_>,
     pclntab: &ParsedPclntab<'_>,
@@ -776,7 +1203,9 @@ fn find_moduledata(
         return None;
     }
 
-    let data = ctx.data();
+    // Read through the address-space view so chained-fixup pointers (Mach-O
+    // plugins / CGO) are already rebased to real VAs.
+    let data = ctx.structure_search_data();
     let sections = ctx.sections();
     let go_minor = go_version.and_then(parse_go_minor_version);
     let has_typelink = sections.typelink.is_some();
@@ -793,15 +1222,15 @@ fn find_moduledata(
         );
     }
 
-    if ctx.format() == BinaryFormat::Pe {
-        return find_moduledata_pe(ctx, pclntab, has_typelink, go_minor);
-    }
-
     if ctx.format() == BinaryFormat::Wasm {
         return find_moduledata_wasm(ctx, pclntab, has_typelink, go_minor);
     }
 
-    None
+    // No dedicated `.go.module` section. That section was added in Go 1.26, so
+    // older ELF / Mach-O binaries (and every PE) keep moduledata in
+    // `.noptrdata` with no name — locate it by scanning for its pcHeader
+    // pointer.
+    find_moduledata_by_scan(ctx, pclntab, has_typelink, go_minor)
 }
 
 /// Wasm moduledata discovery: scan the linear-memory image for a
@@ -872,15 +1301,18 @@ fn find_moduledata_wasm(
     None
 }
 
-/// PE moduledata discovery: scan for a pointer-aligned value matching the
-/// pclntab VA, then validate by parsing.
-fn find_moduledata_pe(
+/// Section-less moduledata discovery (PE, and ELF / Mach-O before Go 1.26):
+/// scan file bytes for a pointer-aligned value matching the pclntab VA — the
+/// moduledata's first field is `pcHeader *pcHeader` — then validate by parsing.
+fn find_moduledata_by_scan(
     ctx: &BinaryContext<'_>,
     pclntab: &ParsedPclntab<'_>,
     has_typelink: bool,
     go_minor: Option<u32>,
 ) -> Option<Moduledata> {
-    let data = ctx.data();
+    // The scan looks for the pcHeader pointer; on chained-fixup Mach-O it must
+    // run over the rebased view so the stored pointer matches the pclntab VA.
+    let data = ctx.structure_search_data();
     let pclntab_va = ctx.file_to_va(pclntab.offset)?;
     let ps = pclntab.ptr_size as usize;
     if ps == 0 {
@@ -893,8 +1325,7 @@ fn find_moduledata_pe(
         _ => return None,
     };
 
-    let search_start = data.len().checked_div(4).unwrap_or(0);
-    let mut offset = search_start;
+    let mut offset = 0usize;
     while let Some(end) = offset.checked_add(ps) {
         if end > data.len() {
             break;

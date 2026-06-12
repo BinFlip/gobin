@@ -30,6 +30,8 @@
 //! - **Build info**: accessed by `runtime/debug.ReadBuildInfo()`
 //! - **Types**: needed for `reflect`, interface dispatch, `fmt.Printf("%T", x)`
 
+use std::borrow::Cow;
+
 use crate::{
     detection::Confidence,
     structures::pclntab::{FuncData, FuncEntryIter, ParsedPclntab},
@@ -169,6 +171,59 @@ impl std::fmt::Display for ObfuscationKind {
             Self::Other { reason } => write!(f, "other({reason})"),
         }
     }
+}
+
+/// FIPS-140 mode information for a Go 1.24+ binary.
+///
+/// The authoritative "is this a FIPS build?" signal is the `GOFIPS140` build
+/// setting, recorded in build info. The `__go_fipsinfo` section's integrity
+/// sum (the `go:fipsinfo` symbol, `struct { Magic [16]byte; Sum [32]byte }`)
+/// is present in *every* crypto-linked binary, so it alone does **not**
+/// indicate FIPS mode — it's exposed here only as a content identifier for
+/// the embedded crypto module.
+///
+/// [`crate::GoBinary::fips_info`] returns this only when `GOFIPS140` is set;
+/// it is therefore `None` when build info is absent (e.g. stripped by
+/// `garble`), even if the integrity section survives.
+///
+/// Source: `src/crypto/internal/fips140/check/check.go`,
+/// `src/runtime/debug/mod.go` (`GOFIPS140`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FipsInfo<'a> {
+    /// The `GOFIPS140` build-setting value (e.g. `"v1.0.0"` or
+    /// `"v1.0.0-c2097c7c"`).
+    pub version: &'a str,
+    /// Whether `fips140=on` appears in `DefaultGODEBUG` — i.e. FIPS
+    /// enforcement is active by default at runtime (vs. `fips140=only`/opt-in).
+    pub enforced_by_default: bool,
+    /// The 32-byte integrity sum from `__go_fipsinfo`, when the section is
+    /// present and carries the expected magic. A content identifier for the
+    /// embedded FIPS crypto module.
+    pub module_sum: Option<[u8; 32]>,
+}
+
+/// One package-initialization task from `moduledata.inittasks` (Go 1.24+).
+///
+/// Each task runs an ordered list of init functions at program startup. See
+/// [`crate::GoBinary::init_order`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitTask<'a> {
+    /// Package this task initializes, derived from the first init function's
+    /// name (e.g. `"runtime"`, `"main"`). `None` when no function name could
+    /// be resolved.
+    pub package: Option<&'a str>,
+    /// The init functions, in execution order.
+    pub functions: Vec<InitFunc<'a>>,
+}
+
+/// A single init function within an [`InitTask`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitFunc<'a> {
+    /// Virtual address of the function entry point.
+    pub entry_va: u64,
+    /// Resolved package-qualified name (e.g. `"main.init.0"`), if the entry VA
+    /// maps to a known pclntab function. `None` for stripped/unmapped entries.
+    pub name: Option<&'a str>,
 }
 
 /// Structural description of a method receiver type parsed from a function name.
@@ -356,6 +411,14 @@ fn has_numeric_suffix_after(name: &str, marker: &str) -> bool {
     false
 }
 
+/// Package path portion of a fully-qualified function name, or `None` if the
+/// name has no package boundary. Mirrors [`FunctionInfo::package`] for callers
+/// that hold a bare `&str`.
+pub(crate) fn package_of(name: &str) -> Option<&str> {
+    let boundary = package_boundary(name)?;
+    name.get(..boundary)
+}
+
 /// Locate the package/short-name boundary in a Go function name.
 ///
 /// Returns the byte index of the `.` that separates package path from the
@@ -449,8 +512,7 @@ impl BuildMode {
     /// `"archive"`, `"shared"`). For [`BuildMode::Other`] the inner verbatim
     /// string is returned as a borrowed `Cow`. See the `# Stability` section
     /// on [`BuildMode`] for the durability contract.
-    pub fn as_str(&self) -> std::borrow::Cow<'static, str> {
-        use std::borrow::Cow;
+    pub fn as_str(&self) -> Cow<'static, str> {
         match self {
             Self::Exe => Cow::Borrowed("exe"),
             Self::Pie => Cow::Borrowed("pie"),
@@ -502,6 +564,9 @@ pub struct BuildInfo<'a> {
     pub main_module: Option<&'a str>,
     /// Main module version (e.g. `"(devel)"` or `"v1.2.3"`).
     pub main_version: Option<&'a str>,
+    /// Main module `go.sum` hash (`h1:…`), present when the binary was built
+    /// from a released, checksummed module (absent for `(devel)` builds).
+    pub main_module_sum: Option<&'a str>,
     /// Module dependencies, including sums and any active replacements.
     pub deps: Vec<DepEntry<'a>>,
     /// Build settings as `(key, value)` pairs (borrowed from the modinfo blob).
@@ -554,10 +619,28 @@ impl<'a> BuildInfo<'a> {
 
     /// Iterate over `(path, version)` pairs for module dependencies.
     ///
-    /// For full structural detail (sums, replacements) iterate [`Self::deps`]
-    /// directly.
+    /// For full structural detail (sums, replacements) use [`Self::deps_full`]
+    /// or iterate [`Self::deps`] directly.
     pub fn dependencies(&self) -> impl Iterator<Item = (&'a str, Option<&'a str>)> + '_ {
         self.deps.iter().map(|d| (d.path, d.version))
+    }
+
+    /// Iterate over full [`DepEntry`] records, including `go.sum` hashes and
+    /// any active `replace` directive (`=> path[ version][ h1:sum]`).
+    ///
+    /// This surfaces the supply-chain detail that [`Self::dependencies`]
+    /// collapses — e.g. answering "is this binary using the official
+    /// `golang.org/x/crypto` or a forked/replaced one?".
+    pub fn deps_full(&self) -> impl Iterator<Item = &DepEntry<'a>> + '_ {
+        self.deps.iter()
+    }
+
+    /// The main module's `go.sum` hash (`h1:…`), if the build recorded one.
+    ///
+    /// Present for binaries built from a released, checksummed module; absent
+    /// for `(devel)` / local builds.
+    pub fn module_sum(&self) -> Option<&'a str> {
+        self.main_module_sum
     }
 
     /// Iterate over `(key, value)` build setting pairs.
@@ -1146,6 +1229,37 @@ mod tests {
     fn package_returns_none_when_no_dot_after_path() {
         assert_eq!(make("noslash").package(), None);
         assert_eq!(make("github.com/user/pkg").package(), None);
+    }
+
+    #[test]
+    fn deps_full_and_module_sum_surface_parsed_detail() {
+        let info = BuildInfo {
+            main_module: Some("example.com/app"),
+            main_version: Some("v1.2.3"),
+            main_module_sum: Some("h1:mainsum="),
+            deps: vec![DepEntry {
+                path: "golang.org/x/crypto",
+                version: Some("v0.1.0"),
+                sum: Some("h1:depsum="),
+                replacement: Some(DepReplacement {
+                    path: "github.com/forked/crypto",
+                    version: Some("v0.1.1"),
+                    sum: Some("h1:repl="),
+                }),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(info.module_sum(), Some("h1:mainsum="));
+        let deps: Vec<&DepEntry<'_>> = info.deps_full().collect();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].sum, Some("h1:depsum="));
+        assert_eq!(
+            deps[0].replacement.as_ref().map(|r| r.path),
+            Some("github.com/forked/crypto")
+        );
+        // The lossy convenience iterator still yields just (path, version).
+        let simple: Vec<_> = info.dependencies().collect();
+        assert_eq!(simple, vec![("golang.org/x/crypto", Some("v0.1.0"))]);
     }
 
     #[test]

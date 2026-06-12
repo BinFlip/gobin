@@ -15,8 +15,8 @@
 //! - `Align_`      (u8)
 //! - `FieldAlign_` (u8)
 //! - `Kind_`       (u8)
-//! - `Equal`       (uintptr, function pointer -- skipped)
-//! - `GCData`      (uintptr, pointer -- skipped)
+//! - `Equal`       (uintptr, equality function pointer)
+//! - `GCData`      (uintptr, GC bitmap pointer)
 //! - `Str`         (NameOff / i32)
 //! - `PtrToThis`   (TypeOff / i32)
 //!
@@ -51,6 +51,10 @@ pub struct AbiType {
     pub field_align_: u8,
     /// Kind of the type (low 5 bits encode `abi.Kind`).
     pub kind_: u8,
+    /// VA of the type's equality function (`Equal`), or `0` if none.
+    pub equal: u64,
+    /// VA of the type's GC bitmap (`GCData`), or `0` if none.
+    pub gcdata: u64,
     /// Offset into the names table for this type's string representation.
     pub str_off: i32,
     /// Offset into the typelinks table for a pointer-to-this-type descriptor.
@@ -92,8 +96,10 @@ impl AbiType {
         let kind_ = *data.get(off.checked_add(3)?)?;
         off = off.checked_add(4)?;
 
-        // Skip Equal (uintptr) and GCData (uintptr)
-        off = off.checked_add(p.saturating_mul(2))?;
+        let equal = read_uintptr(data, off, ps)?;
+        off = off.checked_add(p)?;
+        let gcdata = read_uintptr(data, off, ps)?;
+        off = off.checked_add(p)?;
 
         let str_off = read_i32(data, off)?;
         off = off.checked_add(4)?;
@@ -108,6 +114,8 @@ impl AbiType {
             align_,
             field_align_,
             kind_,
+            equal,
+            gcdata,
             str_off,
             ptr_to_this,
         })

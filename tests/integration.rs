@@ -21,14 +21,24 @@ use gobin::{
     structures::{Arch, PclntabVersion},
 };
 
-const BASIC_NORMAL: &str = "tests/samples/basic_normal";
-const BASIC_STRIPPED: &str = "tests/samples/basic_stripped";
-const BASIC_LINUX: &str = "tests/samples/basic_linux_amd64";
-const BASIC_WINDOWS: &str = "tests/samples/basic_windows_amd64.exe";
-const BASIC_WINDOWS_STRIPPED: &str = "tests/samples/basic_windows_stripped.exe";
-const MINIMAL_NORMAL: &str = "tests/samples/minimal_normal";
-const MINIMAL_STRIPPED: &str = "tests/samples/minimal_stripped";
-const BASIC_WASM: &str = "tests/samples/basic_wasm.wasm";
+// Representative fixtures for the per-feature tests below. The full
+// version×format matrix is swept separately in `mod matrix`. Fixtures are
+// built reproducibly with `-trimpath` (see tests/samples/build.sh), so they
+// carry no local filesystem paths.
+const BASIC_NORMAL: &str = "tests/samples/basic_go126_darwin_arm64";
+const BASIC_STRIPPED: &str = "tests/samples/basic_go126_darwin_arm64_stripped";
+const BASIC_LINUX: &str = "tests/samples/basic_go126_linux_amd64";
+const BASIC_WINDOWS: &str = "tests/samples/basic_go126_windows_amd64.exe";
+const BASIC_WINDOWS_STRIPPED: &str = "tests/samples/basic_go126_windows_amd64_stripped.exe";
+const MINIMAL_NORMAL: &str = "tests/samples/minimal_go126_darwin_arm64";
+const MINIMAL_STRIPPED: &str = "tests/samples/minimal_go126_darwin_arm64_stripped";
+const BASIC_WASM: &str = "tests/samples/basic_go126_wasip1_wasm";
+const BASIC_GO127: &str = "tests/samples/basic_go127_darwin_arm64";
+const BASIC_GO127_STRIPPED: &str = "tests/samples/basic_go127_darwin_arm64_stripped";
+const BASIC_FIPS: &str = "tests/samples/fips_go126_darwin_arm64";
+const BASIC_EMBED: &str = "tests/samples/embed_go126_darwin_arm64";
+const BASIC_EMBED_STRIPPED: &str = "tests/samples/embed_go126_darwin_arm64_stripped";
+const BASIC_EMBED_LINUX: &str = "tests/samples/embed_go126_linux_amd64";
 
 fn load(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
@@ -58,6 +68,351 @@ fn detect_wasm_go_binary() {
     assert_eq!(bin.confidence(), Confidence::High);
     assert!(bin.go_version().unwrap().starts_with("go1."));
     assert!(bin.build_id().is_some(), "Wasm carries go:buildid section");
+}
+
+#[test]
+fn go127_detects_v5_moduledata() {
+    use gobin::structures::moduledata::ModuledataVersion;
+    let data = load(BASIC_GO127);
+    let bin = GoBinary::parse(&data).expect("Go 1.27 binary should parse");
+    let md = bin.moduledata().expect("moduledata should be located");
+    assert_eq!(
+        md.version,
+        ModuledataVersion::V5,
+        "go1.27-devel should select the V5 layout"
+    );
+    // Regression guard: the old speculative V5 branch hardcoded these to
+    // None, which silently disabled inline-tree and funcdata resolution.
+    assert!(md.gofunc.is_some(), "V5 must still carry gofunc");
+    assert!(md.rodata.is_some(), "V5 must still carry rodata");
+    assert!(md.itaboffset.is_some(), "V5 stores itabs at itaboffset");
+    assert!(md.typelinks.is_none(), "V5 dropped the typelinks slice");
+}
+
+#[test]
+fn go127_itab_pairs_via_inline_region() {
+    // V5 removed .itablink / itablinks; itabs are walked inline at
+    // types+itaboffset. This exercises the third itab strategy.
+    let data = load(BASIC_GO127);
+    let bin = GoBinary::parse(&data).unwrap();
+    let pairs: Vec<_> = bin.itab_pairs().collect();
+    assert!(
+        pairs.len() >= 5,
+        "a binary using fmt + several interface impls should expose many \
+         itabs, got {}",
+        pairs.len()
+    );
+    // Every pair must carry plausible (non-zero) type-descriptor VAs.
+    for p in &pairs {
+        assert!(p.iface_type_va != 0 && p.concrete_type_va != 0);
+    }
+}
+
+#[test]
+fn go127_types_still_extract() {
+    // Type extraction must fall back to descriptor-walking now that the
+    // .typelink section is gone in V5.
+    let data = load(BASIC_GO127);
+    let bin = GoBinary::parse(&data).unwrap();
+    let n = bin.types().count();
+    assert!(n > 100, "expected many types via descriptor walk, got {n}");
+}
+
+#[test]
+fn go127_stripped_still_v5() {
+    use gobin::structures::moduledata::ModuledataVersion;
+    let data = load(BASIC_GO127_STRIPPED);
+    let bin = GoBinary::parse(&data).expect("stripped Go 1.27 should parse");
+    let md = bin
+        .moduledata()
+        .expect("moduledata located even when stripped");
+    assert_eq!(md.version, ModuledataVersion::V5);
+    assert!(bin.itab_pairs().count() >= 5);
+}
+
+const COVER_LINUX: &str = "tests/samples/cover_go126_linux_amd64";
+
+#[test]
+fn moduledata_segments_and_identity() {
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+    let md = bin.moduledata().expect("moduledata");
+
+    // The main executable owns `main`, has no plugin/module name.
+    assert_eq!(bin.is_main_module(), Some(true));
+    assert_eq!(bin.module_name(), None);
+    assert_eq!(bin.plugin_path(), None);
+
+    // Data-segment boundaries are populated and ordered.
+    for (name, r) in [
+        ("noptrdata", md.noptrdata),
+        ("data", md.data),
+        ("noptrbss", md.noptrbss),
+    ] {
+        assert!(
+            r.start != 0 && r.end >= r.start,
+            "{name} range invalid: {r:?}"
+        );
+    }
+    assert!(md.end > md.text, "module end should be past text");
+    // A plain build is not coverage-instrumented.
+    assert!(!bin.is_coverage_build());
+}
+
+#[test]
+fn itab_method_pointers_resolve_into_text() {
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+    let md = bin.moduledata().unwrap();
+    let (text, etext) = (md.text, md.etext);
+
+    let mut total = 0usize;
+    for pair in bin.itab_pairs().take(60) {
+        for va in bin.itab_methods(&pair) {
+            total += 1;
+            assert!(
+                va == 0 || (va >= text && va < etext),
+                "itab method ptr {va:#x} not in text"
+            );
+        }
+    }
+    assert!(
+        total > 10,
+        "expected resolved itab method pointers, got {total}"
+    );
+}
+
+#[test]
+fn macho_plugin_chained_fixups_resolve() {
+    // A Go plugin (-buildmode=plugin) is an externally-linked Mach-O dylib
+    // whose data pointers are chained fixups; without rebasing, no pointer
+    // resolves. With it, types / plugin tables come back.
+    let data = load("tests/samples/plugin_go126_darwin_arm64.so");
+    let bin = GoBinary::parse(&data).unwrap();
+
+    assert_eq!(
+        bin.is_main_module(),
+        Some(false),
+        "a plugin is not the main module"
+    );
+    assert_eq!(bin.plugin_path(), Some("gobin.test/plugin"));
+    assert!(
+        bin.types().count() > 100,
+        "types must resolve through fixups"
+    );
+
+    // Exported plugin symbols (moduledata.ptab) decode with names.
+    let exports: BTreeSet<&str> = bin.plugin_exports().iter().filter_map(|e| e.name).collect();
+    assert!(exports.contains("ExportedFunc"), "saw {exports:?}");
+    assert!(exports.contains("ExportedVar"), "saw {exports:?}");
+
+    // Per-package ABI hashes resolve to real package paths.
+    let pkgs: BTreeSet<&str> = bin
+        .package_hashes()
+        .iter()
+        .filter_map(|h| h.module_name)
+        .collect();
+    assert!(
+        pkgs.iter().any(|p| p.starts_with("internal/")),
+        "saw {pkgs:?}"
+    );
+}
+
+#[test]
+fn moduledata_subslice_decoders() {
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    // A normal binary has exactly one text section, ordered.
+    let ts = bin.text_sections();
+    assert_eq!(ts.len(), 1, "ordinary binary has one text section");
+    assert!(ts[0].end >= ts[0].vaddr);
+
+    // Plugin/shared-only tables are empty for a plain executable, and the
+    // decoders must not panic.
+    assert!(bin.plugin_exports().is_empty());
+    assert!(bin.package_hashes().is_empty());
+    assert!(bin.module_hashes().is_empty());
+}
+
+#[test]
+fn gc_pointer_map_locates_global_pointers() {
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+    let md = bin.moduledata().unwrap();
+    let (text, end) = (md.text, md.end);
+
+    let pm = bin.data_pointer_map().expect("data pointer map");
+    assert!(
+        pm.pointer_count() > 50,
+        "expected many global data pointers"
+    );
+    assert!(
+        pm.pointer_count() < pm.words.len(),
+        "not every word is a pointer"
+    );
+
+    // Every word the map flags as a pointer must actually hold a pointer-shaped
+    // value: nil, or an address inside the module image. Scalar garbage here
+    // would mean the GC program was decoded wrong.
+    let ctx = bin.context();
+    let mut checked = 0usize;
+    for va in pm.pointer_vas().take(300) {
+        if let Some(sl) = ctx.slice_at_va(va)
+            && let Ok(bytes) = sl.get(..8).unwrap_or(&[]).try_into()
+        {
+            let v = u64::from_le_bytes(bytes);
+            checked += 1;
+            assert!(
+                v == 0 || (v >= text && v < end),
+                "pointer word {va:#x} holds non-pointer {v:#x}"
+            );
+        }
+    }
+    assert!(checked > 100, "should have sampled many pointer words");
+
+    // bss also decodes.
+    assert!(bin.bss_pointer_map().unwrap().pointer_count() > 50);
+}
+
+#[test]
+fn coverage_build_detected() {
+    let data = load(COVER_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+    assert!(
+        bin.is_coverage_build(),
+        "a -cover binary should report a coverage-counter region"
+    );
+    let md = bin.moduledata().unwrap();
+    assert!(md.covctrs.is_some_and(|r| !r.is_empty()));
+}
+
+#[test]
+fn init_order_lists_runtime_and_main() {
+    let data = load(BASIC_GO127);
+    let bin = GoBinary::parse(&data).unwrap();
+    let tasks = bin.init_order();
+    assert!(
+        tasks.len() >= 3,
+        "a fmt-using program runs several package inits, got {}",
+        tasks.len()
+    );
+    let packages: BTreeSet<&str> = tasks.iter().filter_map(|t| t.package).collect();
+    assert!(
+        packages.contains("runtime"),
+        "runtime should initialize, saw {packages:?}"
+    );
+    // Every resolved init function name should end in an `init`-shaped suffix.
+    let resolved: Vec<&str> = tasks
+        .iter()
+        .flat_map(|t| t.functions.iter())
+        .filter_map(|f| f.name)
+        .collect();
+    assert!(
+        !resolved.is_empty(),
+        "at least some init fns should resolve"
+    );
+    assert!(
+        resolved.iter().all(|n| n.contains("init")),
+        "init task entries should be init functions, saw {resolved:?}"
+    );
+}
+
+#[test]
+fn init_order_empty_is_safe() {
+    // Older binaries (pre-1.24 / no inittasks) must return cleanly, not panic.
+    let data = load(MINIMAL_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    let _ = bin.init_order(); // must not panic regardless of availability
+}
+
+fn assert_embed_assets(path: &str) {
+    let data = load(path);
+    let bin = GoBinary::parse(&data).unwrap();
+    let assets = bin.embedded_assets();
+    let by_path: std::collections::BTreeMap<&str, &[u8]> =
+        assets.iter().map(|a| (a.path, a.data)).collect();
+
+    // The three embedded files (recovered bytes must match the sources).
+    assert_eq!(
+        by_path.get("assets/hello.txt").copied(),
+        Some(b"hello embedded world\n".as_slice()),
+        "{path}: hello.txt content"
+    );
+    assert_eq!(
+        by_path.get("assets/data.bin").copied(),
+        Some(b"second asset file\n".as_slice()),
+        "{path}: data.bin content"
+    );
+    assert!(
+        by_path.contains_key("assets/nested/inner.dat"),
+        "{path}: nested file present"
+    );
+    // Directory entries are surfaced with the trailing slash and no bytes.
+    let dirs: Vec<&str> = assets.iter().filter(|a| a.is_dir).map(|a| a.path).collect();
+    assert!(
+        dirs.contains(&"assets/nested/"),
+        "{path}: nested dir entry, saw {dirs:?}"
+    );
+    assert!(
+        assets
+            .iter()
+            .filter(|a| a.is_dir)
+            .all(|a| a.data.is_empty()),
+        "{path}: directory entries carry no bytes"
+    );
+}
+
+#[test]
+fn embedded_assets_recovered_with_symbols() {
+    assert_embed_assets(BASIC_EMBED);
+}
+
+#[test]
+fn embedded_assets_recovered_when_stripped() {
+    // The scanner is symbol-independent: -ldflags="-s -w" must not hide assets.
+    assert_embed_assets(BASIC_EMBED_STRIPPED);
+}
+
+#[test]
+fn embedded_assets_recovered_on_elf() {
+    // Same extraction path works across container formats (ELF here).
+    assert_embed_assets(BASIC_EMBED_LINUX);
+}
+
+#[test]
+fn embedded_assets_empty_for_non_embed_binary() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    assert!(
+        bin.embedded_assets().is_empty(),
+        "a binary with no //go:embed must yield no assets (false-positive guard)"
+    );
+}
+
+#[test]
+fn fips_info_detected_in_fips_build() {
+    let data = load(BASIC_FIPS);
+    let bin = GoBinary::parse(&data).unwrap();
+    let fips = bin
+        .fips_info()
+        .expect("GOFIPS140 build should report FIPS info");
+    assert!(fips.version.starts_with("v1.0.0"));
+    assert!(fips.enforced_by_default, "fips140=on in DefaultGODEBUG");
+    // The integrity sum is present and non-zero.
+    assert!(fips.module_sum.is_some_and(|s| s != [0u8; 32]));
+}
+
+#[test]
+fn fips_info_absent_in_normal_build() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    // The fipsinfo section is linked into modern Go binaries, but without the
+    // GOFIPS140 build setting it is not a FIPS build.
+    assert!(
+        bin.fips_info().is_none(),
+        "non-FIPS builds must not report FIPS mode"
+    );
 }
 
 #[test]
@@ -270,7 +625,7 @@ fn build_info_macho() {
     let data = load(BASIC_NORMAL);
     let bin = GoBinary::parse(&data).unwrap();
     let info = bin.build_info().expect("Should have build info");
-    assert_eq!(info.main_path, Some("test-basic"));
+    assert_eq!(info.main_path, Some("gobin.test/basic"));
     assert_eq!(info.goos(), Some("darwin"));
     assert_eq!(info.goarch(), Some("arm64"));
 }
@@ -289,7 +644,7 @@ fn build_info_pe() {
     let data = load(BASIC_WINDOWS);
     let bin = GoBinary::parse(&data).unwrap();
     let info = bin.build_info().expect("PE should have build info");
-    assert_eq!(info.main_path, Some("test-basic"));
+    assert_eq!(info.main_path, Some("gobin.test/basic"));
     assert_eq!(info.goos(), Some("windows"));
     assert_eq!(info.goarch(), Some("amd64"));
 }
@@ -952,13 +1307,15 @@ fn strings_iter_recovers_runtime_literals() {
         unique.len()
     );
 
-    // Spot-check: a few well-known runtime / stdlib panic messages should
-    // appear in any non-trivial Go binary built with the `gc` toolchain.
-    let needles = ["nil context", "unreachable"];
+    // Spot-check: well-known runtime panic-message fragments should appear in
+    // any non-trivial Go binary built with the `gc` toolchain. Match as
+    // substrings since the compiler often emits them inside longer literals
+    // (e.g. "invalid memory address or nil pointer dereference").
+    let needles = ["unreachable", "invalid memory address"];
     for needle in needles {
         assert!(
-            unique.contains(needle),
-            "expected to find runtime literal {:?} in {} unique strings",
+            unique.iter().any(|s| s.contains(needle)),
+            "expected a runtime literal containing {:?} among {} unique strings",
             needle,
             unique.len(),
         );
@@ -1372,6 +1729,7 @@ fn type_detail_scalar_accessors() {
     let arr = TypeDetail::Array {
         len: 16,
         elem_va: 0,
+        slice_va: 0,
     };
     assert_eq!(arr.array_len(), Some(16));
     assert_eq!(arr.chan_dir(), None);
@@ -1399,6 +1757,7 @@ fn type_detail_scalar_accessors() {
     let i = TypeDetail::Interface {
         method_count: 7,
         methods: vec![],
+        pkg_path: None,
     };
     assert_eq!(i.interface_method_count(), Some(7));
 
@@ -1439,7 +1798,8 @@ fn enum_display_strings_are_stable() {
     assert_eq!(
         TypeDetail::Array {
             len: 4,
-            elem_va: 0x1000
+            elem_va: 0x1000,
+            slice_va: 0,
         }
         .kind_str(),
         "array"
@@ -1455,7 +1815,12 @@ fn enum_display_strings_are_stable() {
     assert_eq!(
         TypeDetail::Map {
             key_va: 0x1,
-            elem_va: 0x2
+            elem_va: 0x2,
+            group_va: 0,
+            hasher_va: 0,
+            key_stride: 0,
+            elem_stride: 0,
+            flags: 0,
         }
         .kind_str(),
         "map"
@@ -1640,6 +2005,7 @@ fn interface_methods_resolved_when_present() {
         if let TypeDetail::Interface {
             method_count,
             methods,
+            ..
         } = &t.detail
             && *method_count > 0
         {
@@ -1689,10 +2055,10 @@ fn func_type_carries_param_vas() {
                 "{}: outputs.len() must equal out_count",
                 t.name,
             );
-            if inputs.iter().any(|&va| va != 0) {
+            if inputs.iter().any(|r| r.va != 0) {
                 saw_input_va = true;
             }
-            if outputs.iter().any(|&va| va != 0) {
+            if outputs.iter().any(|r| r.va != 0) {
                 saw_output_va = true;
             }
         }
@@ -1703,6 +2069,140 @@ fn func_type_carries_param_vas() {
     );
     assert!(saw_input_va, "at least one input VA should be nonzero");
     assert!(saw_output_va, "at least one output VA should be nonzero");
+}
+
+#[test]
+fn all_types_enumerates_more_and_resolves_tags() {
+    use gobin::structures::types::TypeDetail;
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    let canonical = bin.types().count();
+    let all = bin.all_types();
+    // The transitive walk reaches strictly more than the typelink set.
+    assert!(
+        all.len() > canonical,
+        "all_types ({}) should exceed types ({canonical})",
+        all.len()
+    );
+    // Every enumerated type has a clean name and a valid descriptor VA.
+    for t in &all {
+        assert!(
+            t.name.is_empty() || !t.name.bytes().any(|c| c < 0x20),
+            "garbage type name: {:?}",
+            t.name
+        );
+        assert!(t.descriptor_va != 0);
+    }
+    // Struct field tags resolve (only reachable via the full walk, since the
+    // tagged struct types are not all in typelink).
+    let mut tagged = 0usize;
+    let mut saw_keyvalue_tag = false;
+    for t in &all {
+        if let TypeDetail::Struct { fields, .. } = &t.detail {
+            for f in fields {
+                if let Some(tag) = f.tag {
+                    tagged += 1;
+                    // Conventional `key:"value"` tags (e.g. json/yaml) appear in
+                    // stdlib structs — at least one should decode cleanly.
+                    if tag.contains(":\"") {
+                        saw_keyvalue_tag = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        tagged > 20,
+        "expected many tagged struct fields, got {tagged}"
+    );
+    assert!(
+        saw_keyvalue_tag,
+        "expected a conventional key:\"value\" struct tag"
+    );
+}
+
+#[test]
+fn type_at_va_resolves_referenced_types() {
+    use gobin::structures::types::TypeDetail;
+    let data = load(BASIC_LINUX);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    // Find a slice type and resolve its element type by VA.
+    let slice = bin
+        .types()
+        .find_map(|t| match t.detail {
+            TypeDetail::Slice { elem_va } if elem_va != 0 => Some(elem_va),
+            _ => None,
+        })
+        .expect("a slice type with an element");
+    let elem = bin.type_at(slice).expect("element type resolves");
+    assert!(!elem.name.is_empty());
+}
+
+#[test]
+fn type_descriptor_full_fields() {
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    // A named type with methods exposes its import path (from UncommonType),
+    // the equality-fn and GC-bitmap pointers, and the raw tflag.
+    let t = bin
+        .types()
+        .find(|t| t.name.contains("TestStruct") && t.has_uncommon)
+        .expect("TestStruct with methods");
+    assert_eq!(t.pkg_path, Some("main"), "uncommon pkg_path");
+    assert!(t.equal_va != 0, "equality fn VA should be set");
+    assert!(t.gcdata_va != 0, "gcdata VA should be set");
+    assert!(t.tflag & 0x01 != 0, "TFlagUncommon bit set");
+
+    // At least some types expose a pointer-to-this descriptor offset.
+    assert!(
+        bin.types().any(|t| t.ptr_to_this != 0),
+        "expected some types to carry a *T offset"
+    );
+}
+
+#[test]
+fn type_names_resolve_for_fields_methods_and_params() {
+    use gobin::structures::types::TypeDetail;
+
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+
+    let mut resolved_field = false;
+    let mut resolved_param = false;
+    let mut named_field_value = None;
+    for t in bin.types() {
+        match &t.detail {
+            TypeDetail::Struct { fields, .. } => {
+                for n in fields.iter().filter_map(|f| f.type_name) {
+                    resolved_field = true;
+                    named_field_value.get_or_insert_with(|| n.to_string());
+                }
+            }
+            TypeDetail::Func {
+                inputs, outputs, ..
+            } if inputs
+                .iter()
+                .chain(outputs.iter())
+                .any(|r| r.name.is_some()) =>
+            {
+                resolved_param = true;
+            }
+            _ => {}
+        }
+    }
+    // A stdlib-linked binary has plenty of named struct fields and func params;
+    // the leaf (concrete) referenced types should resolve to names. Method /
+    // interface-method signature types are unnamed Go func types, so their
+    // `type_name` is expectedly None — covered by the doc contract, not here.
+    assert!(resolved_field, "expected some struct field type names");
+    assert!(resolved_param, "expected some func param type names");
+    assert!(
+        named_field_value.is_some_and(|n| !n.is_empty()),
+        "a resolved field type name should be non-empty"
+    );
 }
 
 #[test]
@@ -1737,9 +2237,9 @@ fn map_carries_key_and_elem_va() {
     let bin = GoBinary::parse(&data).unwrap();
     let types: Vec<_> = bin.types().collect();
 
-    let any_map = types.iter().any(
-        |t| matches!(&t.detail, TypeDetail::Map { key_va, elem_va } if *key_va != 0 && *elem_va != 0),
-    );
+    let any_map = types.iter().any(|t| {
+        matches!(&t.detail, TypeDetail::Map { key_va, elem_va, .. } if *key_va != 0 && *elem_va != 0)
+    });
     assert!(
         any_map,
         "expected at least one map with nonzero key/elem VAs"
@@ -1764,4 +2264,242 @@ fn methods_resolved_on_concrete_types() {
         "methods.len() should match method_count for {}",
         with_methods.name,
     );
+}
+
+#[test]
+fn init_order_works_on_v4_binary() {
+    // basic_normal is Go 1.26 (V4); the V4 walk was extended to reach inittasks.
+    let data = load(BASIC_NORMAL);
+    let bin = GoBinary::parse(&data).unwrap();
+    let tasks = bin.init_order();
+    let packages: std::collections::BTreeSet<&str> =
+        tasks.iter().filter_map(|t| t.package).collect();
+    assert!(
+        packages.contains("runtime"),
+        "V4 inittasks should resolve runtime init, saw {packages:?}"
+    );
+}
+
+/// Cross-version sweep over the whole fixture matrix (every Go version ×
+/// format × strip variant). These tests discover fixtures by filename
+/// (`<prog>_go<minor>_<goos>_<goarch>[_stripped][.exe]`) so adding a fixture to
+/// `tests/samples/` automatically extends coverage.
+mod matrix {
+    use super::*;
+    use gobin::structures::moduledata::ModuledataVersion;
+
+    struct Fixture {
+        path: String,
+        prog: String,
+        gotag: String,
+        goarch: String,
+    }
+
+    fn discover() -> Vec<Fixture> {
+        let dir = "tests/samples";
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let fname = path.file_name().unwrap().to_str().unwrap().to_string();
+            // Plugins / shared objects (`.so`) have different invariants (no
+            // main.main) and are covered by their own test.
+            if fname.ends_with(".so") {
+                continue;
+            }
+            let name = fname.strip_suffix(".exe").unwrap_or(&fname);
+            let core = name.strip_suffix("_stripped").unwrap_or(name);
+            let parts: Vec<&str> = core.split('_').collect();
+            // <prog>_go<NN>_<goos>_<goarch>
+            if parts.len() != 4 || !parts[1].starts_with("go") {
+                continue;
+            }
+            out.push(Fixture {
+                path: format!("{dir}/{fname}"),
+                prog: parts[0].to_string(),
+                gotag: parts[1].to_string(),
+                goarch: parts[3].to_string(),
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Moduledata layout the parser must detect for each toolchain. epclntab
+    /// was added in Go 1.26, so 1.21 and 1.24 are both V3.
+    fn expected_md(gotag: &str) -> ModuledataVersion {
+        match gotag {
+            // rodata/gofunc arrived in 1.18, so 1.16-1.17 are V2 and 1.18-1.25
+            // are V3 (covctrs in 1.20 and inittasks in 1.21 are sub-details).
+            "go116" => ModuledataVersion::V2,
+            "go119" | "go121" | "go124" => ModuledataVersion::V3,
+            "go126" => ModuledataVersion::V4,
+            "go127" => ModuledataVersion::V5,
+            other => panic!("unknown toolchain tag {other}"),
+        }
+    }
+
+    #[test]
+    fn corpus_covers_all_four_toolchains() {
+        let fixtures = discover();
+        assert!(
+            fixtures.len() >= 20,
+            "expected the full fixture matrix, found {}",
+            fixtures.len()
+        );
+        let tags: BTreeSet<&str> = fixtures.iter().map(|f| f.gotag.as_str()).collect();
+        for t in ["go116", "go119", "go121", "go124", "go126", "go127"] {
+            assert!(tags.contains(t), "matrix is missing toolchain {t}");
+        }
+    }
+
+    #[test]
+    fn every_fixture_parses_with_main() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin =
+                GoBinary::parse(&data).unwrap_or_else(|| panic!("parse failed for {}", fx.path));
+            let names: BTreeSet<&str> = bin.functions().map(|f| f.name).collect();
+            assert!(names.contains("main.main"), "{}: no main.main", fx.path);
+            assert!(
+                names.contains("runtime.main"),
+                "{}: no runtime.main",
+                fx.path
+            );
+        }
+    }
+
+    #[test]
+    fn moduledata_version_matches_toolchain() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let md = bin
+                .moduledata()
+                .unwrap_or_else(|| panic!("{}: moduledata not located", fx.path));
+            assert_eq!(
+                md.version,
+                expected_md(&fx.gotag),
+                "{}: wrong moduledata version",
+                fx.path
+            );
+        }
+    }
+
+    /// The full moduledata tail must parse correctly across the version-
+    /// divergent `bad`/`next` ordering. Validated by the invariants of a normal
+    /// single-module executable: `next`/`typemap` are nil, `bad` is false, and
+    /// the version-gated `epclntab` (1.26+) / `typedesclen` (V5) optionals
+    /// match the toolchain. Garbage from a wrong tail offset would break these.
+    #[test]
+    fn moduledata_full_tail_across_versions() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let md = bin.moduledata().unwrap();
+
+            assert_eq!(md.next, 0, "{}: single module, next should be nil", fx.path);
+            assert_eq!(md.typemap, 0, "{}: typemap is runtime-populated", fx.path);
+            assert!(!md.bad, "{}: a healthy module is not `bad`", fx.path);
+            assert!(md.gcdata != 0, "{}: gcdata pointer should be set", fx.path);
+
+            // epclntab arrived in 1.26 (V4+); typedesclen is V5-only.
+            let v = md.version;
+            use gobin::structures::moduledata::ModuledataVersion as V;
+            assert_eq!(
+                md.epclntab.is_some(),
+                matches!(v, V::V4 | V::V5),
+                "{}: epclntab presence wrong for {v:?}",
+                fx.path
+            );
+            assert_eq!(
+                md.typedesclen.is_some(),
+                matches!(v, V::V5),
+                "{}: typedesclen presence wrong for {v:?}",
+                fx.path
+            );
+        }
+    }
+
+    /// Types, itabs, and init order must all populate on every native `basic`
+    /// fixture — this is the regression guard for the pre-1.26 moduledata scan
+    /// and the per-version epclntab / inittasks handling.
+    #[test]
+    fn types_itabs_inits_across_versions() {
+        for fx in discover()
+            .iter()
+            .filter(|f| f.prog == "basic" && f.goarch != "wasm")
+        {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            assert!(
+                bin.types().count() > 50,
+                "{}: too few types ({})",
+                fx.path,
+                bin.types().count()
+            );
+            assert!(
+                bin.itab_pairs().count() >= 5,
+                "{}: too few itab pairs",
+                fx.path
+            );
+            // `inittasks` was added in Go 1.21 (V3+); V2 (go116) has none, and
+            // go119 (1.19) predates it too.
+            if !matches!(fx.gotag.as_str(), "go116" | "go119") {
+                let inits = bin.init_order();
+                assert!(
+                    inits.iter().any(|t| t.package == Some("runtime")),
+                    "{}: runtime init task missing (inittasks regression)",
+                    fx.path
+                );
+            }
+        }
+    }
+
+    /// Guards the per-version `_func` struct layout (which differs across
+    /// 1.16 / 1.18-1.19 / 1.20+): if `start_line`, `nfuncdata`, or the field
+    /// offsets are read from the wrong place, decoded line numbers and
+    /// funcdata counts become garbage. Checks every functab entry parses and
+    /// yields sane values.
+    #[test]
+    fn func_struct_layout_sane_across_versions() {
+        for fx in discover()
+            .iter()
+            .filter(|f| f.prog == "basic" && f.goarch != "wasm")
+        {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let pcl = bin.pclntab().unwrap();
+            let mut parsed = 0usize;
+            for (_, func_off) in pcl.func_entries() {
+                let fd = match pcl.parse_func(func_off) {
+                    Some(fd) => fd,
+                    None => continue,
+                };
+                parsed += 1;
+                // nfuncdata is a small count (FUNCDATA_* indices top out < 16).
+                assert!(
+                    fd.nfuncdata <= 16,
+                    "{}: implausible nfuncdata {} (wrong _func offset?)",
+                    fx.path,
+                    fd.nfuncdata
+                );
+                // Decoded line numbers must be sane, not garbage from reading
+                // start_line at the wrong offset.
+                for (_, line) in pcl.decode_pcln(&fd) {
+                    // Reading line/start_line from the wrong offset surfaces as
+                    // huge values; small negatives are normal decode sentinels.
+                    assert!(
+                        line < 2_000_000,
+                        "{}: implausible line {} (wrong start_line offset?)",
+                        fx.path,
+                        line
+                    );
+                }
+            }
+            assert!(parsed > 100, "{}: only {parsed} funcs parsed", fx.path);
+        }
+    }
 }

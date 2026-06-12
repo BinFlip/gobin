@@ -80,8 +80,114 @@ fn main() {
 
     print_header(&bin, &funcs, &files, &path, data.len());
     print_build_info(&bin);
+    print_extras(&bin);
     print_functions_and_packages(&funcs, &types);
     print_source_files(&files);
+}
+
+/// FIPS mode, embedded assets, interface tables, and package init order.
+fn print_extras(bin: &GoBinary<'_>) {
+    let fips = bin.fips_info();
+    let assets = bin.embedded_assets();
+    let itab_count = bin.itab_pairs().count();
+    let init_tasks = bin.init_order();
+
+    if fips.is_none() && assets.is_empty() && itab_count == 0 && init_tasks.is_empty() {
+        return;
+    }
+
+    println!("================================================================================");
+    println!("  Runtime & Linker Surfaces");
+    println!("================================================================================");
+    println!();
+
+    if let Some(f) = fips {
+        let sum: String = f.module_sum.map_or_else(
+            || "(no section)".to_string(),
+            |s| s.iter().take(8).map(|b| format!("{b:02x}")).collect(),
+        );
+        println!("[FIPS-140]");
+        println!("  GOFIPS140    : {}", f.version);
+        println!("  Enforced     : {}", f.enforced_by_default);
+        println!("  Module sum   : {sum}...");
+        println!();
+    }
+
+    println!("[Interface tables]");
+    println!("  itab pairs   : {itab_count}");
+    println!();
+
+    if let Some(dp) = bin.data_pointer_map() {
+        let bss = bin.bss_pointer_map();
+        println!("[Global pointers (GC map)]");
+        println!(
+            "  data         : {} of {} words are pointers",
+            dp.pointer_count(),
+            dp.words.len()
+        );
+        if let Some(bp) = bss {
+            println!(
+                "  bss          : {} of {} words are pointers",
+                bp.pointer_count(),
+                bp.words.len()
+            );
+        }
+        println!();
+    }
+
+    if let Some(md) = bin.moduledata() {
+        println!("[Module]");
+        println!(
+            "  Main module  : {}",
+            bin.is_main_module()
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "?".into())
+        );
+        if let Some(name) = bin.module_name() {
+            println!("  Module name  : {name}");
+        }
+        if let Some(path) = bin.plugin_path() {
+            println!("  Plugin path  : {path}");
+        }
+        println!("  Coverage     : {}", bin.is_coverage_build());
+        println!("  Text sects   : {}", md.textsectmap.len);
+        println!(
+            "  Data segs    : noptrdata={}B data={}B bss={}B noptrbss={}B",
+            md.noptrdata.size(),
+            md.data.size(),
+            md.bss.size(),
+            md.noptrbss.size()
+        );
+        println!();
+    }
+
+    if !assets.is_empty() {
+        println!("[Embedded assets ({})]", assets.len());
+        for a in &assets {
+            if a.is_dir {
+                println!("  {:<40} <dir>", a.path);
+            } else {
+                println!("  {:<40} {} bytes", a.path, a.data.len());
+            }
+        }
+        println!();
+    }
+
+    if !init_tasks.is_empty() {
+        let total_fns: usize = init_tasks.iter().map(|t| t.functions.len()).sum();
+        println!(
+            "[Package init order ({} tasks, {total_fns} fns)]",
+            init_tasks.len()
+        );
+        for t in init_tasks.iter().take(20) {
+            let pkg = t.package.unwrap_or("(unresolved)");
+            println!("  {pkg} ({} init fn)", t.functions.len());
+        }
+        if init_tasks.len() > 20 {
+            println!("  … and {} more", init_tasks.len().saturating_sub(20));
+        }
+        println!();
+    }
 }
 
 fn print_report(report: &ConfidenceReport) {

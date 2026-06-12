@@ -5,6 +5,183 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0]
+
+Go 1.27 support, plus five new extraction surfaces aimed at malware /
+supply-chain triage. Verified end-to-end against a `go1.27-devel` toolchain
+and committed sample fixtures (see `tests/samples/README.md`).
+
+### Added
+
+Go 1.27 ("V5") moduledata support — the upstream runtime removed the
+`typelinks`/`itablinks` slices and now stores interface tables inline:
+
+- `ModuledataVersion::V5` is fully parsed: `itaboffset`/`itabsize`,
+  `typedesclen`, and the still-present `rodata`/`gofunc`/`inittasks` fields.
+  The previous speculative V5 branch stopped at `etypes` and hardcoded
+  `rodata`/`gofunc` to `None`, which **silently disabled** `inline_tree()`
+  and `itab_pairs()` on Go 1.27 binaries — now fixed.
+- `itab_pairs()` gained a third strategy: it walks the inline, variable-size
+  itab records at `types + itaboffset` (Go 1.27+), in addition to the
+  `.itablink` section and `moduledata.itablinks` slice used by Go ≤1.26.
+- `parse_go_minor_version` now accepts pre-release toolchain strings
+  (`go1.27-devel_…`, `go1.27rc1`), so V5 detection works before GA.
+
+New extraction surfaces:
+
+- `bin.fips_info() -> Option<FipsInfo>` — FIPS-140 mode (the `GOFIPS140`
+  build setting) plus the `__go_fipsinfo` integrity sum. Returns `None` for
+  non-FIPS builds (the integrity section is linked into every Go 1.24+
+  binary, so it alone is not a FIPS signal).
+- `bin.init_order() -> Vec<InitTask>` — package initialization order decoded
+  from `moduledata.inittasks` (Go 1.24+), with init-function entry VAs
+  resolved to names. Captured for both V4 and V5 layouts.
+- `bin.embedded_assets() -> Vec<EmbeddedAsset>` — `//go:embed` payloads
+  (path, dir flag, backing bytes) decoded from `embed.FS` `[]file` arrays.
+  Symbol-independent (works on stripped binaries) and cross-format
+  (ELF/Mach-O/PE/wasm); validated by enforcing `embed`'s canonical sort
+  order and dir/file hash consistency to avoid false positives. The
+  single-file `embed.String`/`embed.Bytes` form is not recovered (no anchor).
+- `BuildInfo::deps_full()` and `BuildInfo::module_sum()` — surface the
+  already-parsed `go.sum` hashes and `replace` directives that the
+  `dependencies()` convenience iterator collapses (supply-chain analysis).
+
+**Complete moduledata extraction.** The parser walks the whole struct to
+locate types/itabs/funcdata but previously kept only a fraction; now every
+field is captured (the caller decides what is useful), version-gated and
+verified against go1.16-1.27 `runtime/symtab.go`:
+
+- Data/bss segment boundaries (`noptrdata`/`data`/`bss`/`noptrbss` as
+  `VaRange`), `end`, `gcdata`/`gcbss`, `covctrs` (`Option<VaRange>`),
+  `typedesclen` (V5), `epclntab` (1.26+), `textsectmap`, `ptab`,
+  `pluginpath`/`modulename` (`GoStr`), `pkghashes`/`modulehashes`, `has_main`,
+  `bad`, `gcdatamask`/`gcbssmask` (`Bitvector`), `typemap`, and `next`.
+- The version-divergent tail is handled correctly: `bad` sits between
+  `typemap` and `next` before Go 1.24 but moves to right after `hasmain` in
+  1.24+; the GC-mask `bitvector`s are pointer-aligned.
+- New `GoBinary` accessors: `is_main_module()` (vs. plugin/shared),
+  `module_name()`, `plugin_path()`, `is_coverage_build()` (detects `-cover`
+  via a non-empty coverage-counter region).
+- New public types `VaRange`, `Bitvector` (in `structures::moduledata`) and
+  `GoStr` (in `structures::goslice`). The `dump` example prints a new "Module"
+  section.
+
+**Complete type-descriptor extraction.** `abi.Type` now captures the `Equal`
+(equality-function) and `GCData` (GC-bitmap) pointers it previously skipped,
+and `GoType` exposes the full descriptor: `descriptor_va` (its own VA), `tflag`
+(raw flag byte), `ptr_to_this` (the `*T` `TypeOff`), `equal_va`, `gcdata_va`,
+and `pkg_path` — the import path resolved from the `UncommonType` (distinct
+from the name-derived `package()`).
+
+The kind-specific `TypeDetail` variants and `MethodEntry` now carry every
+parsed field: `Array.slice_va`; `Map.group_va`/`hasher_va`/`key_stride`/
+`elem_stride`/`flags`; `Interface.pkg_path`; struct `StructField.tag` (the
+decoded struct tag, e.g. `json:"id"`); and `MethodEntry.interface_text_offset`
+(the `ifn` wrapper entry, alongside the `tfn` direct entry — both now correctly
+treat the `-1` "no body" sentinel as `None`).
+
+**Deep type / runtime enumeration.** New accessors:
+
+- `bin.all_types()` — transitively enumerates **every** reachable type
+  descriptor (BFS from the `typelink` seed set, following element / key /
+  field / parameter / method / pointer-to-this references, each parsed
+  independently by VA and bounded to `[types, etypes)`). Reaches types absent
+  from `typelink` (e.g. a struct used only as a pointer's element, with its
+  field tags). `bin.type_at(va)` parses a single descriptor by address.
+- `bin.data_pointer_map()` / `bss_pointer_map()` — decode the `gcdata` /
+  `gcbss` **GC programs** (`runGCProg` bytecode) into a per-word pointer
+  bitmap: the precise location of every pointer in global memory (function
+  pointers, `itab`/interface pointers, string/slice headers, global `*T`),
+  recoverable without disassembly. New `gcprog::{run_gc_prog, PointerMap}`.
+- `bin.modules()` — walk the `moduledata.next` linked list (one module for a
+  normal static binary; defensive for multi-module images).
+- `bin.itab_methods(pair)` — the `Fun[]` method-pointer array of an itab.
+- `bin.text_sections()`, `bin.plugin_exports()` (ptab), `bin.package_hashes()`
+  / `bin.module_hashes()` (per-package link-time ABI hashes) — decode the
+  remaining moduledata sub-slices (`textsectmap`, `ptab`, `pkghashes`,
+  `modulehashes`).
+- `ParsedPclntab` gained `header_text_start` (the pcHeader `textStart` field,
+  Go 1.18+).
+- New name-decoder `decode_name_and_tag` (handles the struct-tag suffix, both
+  varint and pre-1.17 encodings).
+
+- **Mach-O chained-fixups support.** Externally-linked Mach-O objects (CGO /
+  `-buildmode=plugin` / c-shared) store data pointers as
+  `LC_DYLD_CHAINED_FIXUPS` chains rather than absolute values. The crate now
+  walks those chains and rebases every pointer into an owned shadow image
+  (`structures::macho_fixups`), so pointer-dependent extraction — types,
+  itabs, `ptab` plugin exports, per-package hashes, plugin path — works on
+  these objects exactly as on a pure-Go executable. Supports the
+  `DYLD_CHAINED_PTR_64` and `DYLD_CHAINED_PTR_64_OFFSET` pointer formats.
+  Pure-Go executables are unaffected (no fixups load command → no rebasing).
+
+`Moduledata` gained `itaboffset`, `itabsize`, and `inittasks` fields. New
+public types: `FipsInfo`, `InitTask`, `InitFunc` (in `metadata`),
+`EmbeddedAsset` (in `structures::embed`), `TypeRef` (in `structures::types`).
+The `dump` example prints a new "Runtime & Linker Surfaces" section.
+
+### Changed
+
+- **Breaking (type-name resolution):** `TypeDetail::Func` `inputs` /
+  `outputs` changed from `Vec<u64>` to `Vec<TypeRef>` (VA **plus** resolved
+  display name). `StructField`, `MethodEntry`, and `InterfaceMethod` each
+  gained a `type_name: Option<&str>` field. Method/interface-method
+  signature types are unnamed Go func types, so their `type_name` is usually
+  `None` — resolve the offset to a `TypeDetail::Func` for the full,
+  name-resolved signature. Leaf (param/field) types resolve to names.
+- `itab::extract_iter` now takes `Option<&Moduledata>` instead of
+  `Option<&GoSlice>` (it needs `itaboffset`/`itabsize` for V5).
+- **goblin slimmed down.** Format detection now dispatches to the per-format
+  parser (`elf::Elf`, `mach::MachO`, `pe::PE`) instead of the unified
+  `goblin::Object::parse`, dropping the `te` (UEFI Terse Executable) default
+  feature. PE parsing runs with `ParseOptions` that disable resource, import,
+  certificate, and TLS parsing — none of which the crate reads — avoiding
+  wasted work on Go binaries with large import/resource tables. No change to
+  extracted data.
+
+### Fixed
+
+**Go 1.16-1.17 support** — the parser previously handled only Go 1.18+. The
+pre-1.18 binary format is now decoded: the pcHeader without `textStart`, the
+`2×ptrSize` functab with absolute PCs, the `_func` struct led by an absolute
+`entry uintptr`, and the pre-1.17 type-name encoding (2-byte big-endian length
+vs varint). `entry_off` is rebased against the first function's PC
+(`ParsedPclntab::text_start`) so it stays relative across versions.
+
+**`_func` struct layout is now version-accurate.** `startLine` was added in
+Go 1.20, so the 1.18-1.19 `_func` is 40 bytes (not 44); the parser previously
+assumed the 1.20 layout and mis-read `func_id` / `flag` / `nfuncdata` /
+`start_line` for every 1.18-1.19 binary (function *names* were unaffected,
+which hid it). Decoded via a version-gated `func_layout`.
+
+Moduledata parsing across Go versions, surfaced by rebuilding the test corpus
+against real go1.16 / 1.19 / 1.21 / 1.24 / 1.26 / 1.27 toolchains:
+
+- **`rodata`/`gofunc` are gated to Go 1.18+**, separately from `covctrs`
+  (Go 1.20+). They were previously gated together on the Go120 magic, so
+  1.18-1.19 binaries read `typelinks`/`itablinks` two pointers early — breaking
+  type/itab extraction on PE 1.18-1.19 (ELF/Mach-O were masked by the
+  section-based path). Moduledata `V2` now means 1.16-1.17; `V3` is 1.18-1.25.
+
+- **`epclntab` is gated to Go 1.26+** (it does not exist in 1.24 / 1.25). The
+  old coarse "V4 = 1.24-1.26" mapping skipped a phantom `epclntab` pointer on
+  1.24 / 1.25, shifting `typelinks`/`itablinks`/`inittasks` by one pointer and
+  producing wrong (or empty) results. The walk is now driven by per-field
+  version predicates; the `ModuledataVersion` boundaries are corrected
+  (1.24/1.25 are V3, only 1.26 is V4).
+- **`inittasks` is recognized from Go 1.21+** (was assumed 1.24+), so
+  `init_order()` now works on 1.21-1.23 binaries.
+- **Section-less moduledata discovery** (`find_moduledata_by_scan`): the
+  dedicated `.go.module` section was only added in Go 1.26, so pre-1.26
+  ELF / Mach-O binaries kept moduledata in `.noptrdata` with no section name.
+  Discovery now falls back to a pcHeader-pointer scan for those (previously
+  only PE / wasm did), restoring types, itabs, init order, and inline-tree
+  resolution on Go 1.21-1.25 native binaries.
+- `parse_go_minor_version` parses pre-release toolchain strings
+  (`go1.27-devel_…`), fixing V5 detection before GA.
+
+The fixture corpus was rebuilt reproducibly as a version × format matrix; the integration suite gained a `mod matrix` cross-version sweep. See `tests/samples/README.md`.
+
 ## [0.2.1]
 
 Full WebAssembly container support, a broad set of public-API ergonomics

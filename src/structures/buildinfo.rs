@@ -253,6 +253,9 @@ fn parse_modinfo<'a>(text: &'a str, info: &mut BuildInfo<'a>) {
                 if let Some(v) = parts.get(2) {
                     info.main_version = Some(*v);
                 }
+                if let Some(s) = parts.get(3) {
+                    info.main_module_sum = Some(*s);
+                }
             }
             Some(&"dep") => {
                 if let Some(p) = parts.get(1) {
