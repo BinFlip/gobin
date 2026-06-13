@@ -2112,14 +2112,57 @@ fn all_types_enumerates_more_and_resolves_tags() {
             }
         }
     }
-    assert!(
-        tagged > 20,
-        "expected many tagged struct fields, got {tagged}"
-    );
+    assert!(tagged > 0, "expected at least one tagged struct field");
     assert!(
         saw_keyvalue_tag,
         "expected a conventional key:\"value\" struct tag"
     );
+
+    // Regression guards for the func-type descriptor bug. A mis-located
+    // `UncommonType` (the funcType struct's alignment padding was skipped)
+    // produced a garbage `mcount`; resolving those phantom methods followed
+    // garbage `mtyp` offsets and exploded the transitive closure. Real Go types
+    // have at most ~150 methods, and this fixture's legitimate closure is ~850
+    // types — neither bound is tight, but each is far below the bug's output
+    // (mcount up to 0xFFFF; ~12.8k inflated types).
+    for t in &all {
+        assert!(
+            t.method_count < 500,
+            "absurd method_count {} on type {:?} — UncommonType mis-located?",
+            t.method_count,
+            t.name
+        );
+    }
+    assert!(
+        all.len() < 3000,
+        "all_types inflated to {} — garbage method offsets being followed?",
+        all.len()
+    );
+    // The transitive walk reaches the binary's own tagged structs and decodes
+    // their field tags — covering json, yaml, multi-key, and `,omitempty`.
+    //
+    // (This previously asserted ">20" tagged fields. That count was an artifact
+    // of a func-type descriptor bug: the `UncommonType` for func types was
+    // located short by the funcType struct's alignment padding, so a garbage
+    // `mcount` was read and the phantom methods' garbage `mtyp` offsets were
+    // followed into ~12k unrelated descriptors — inflating `all_types` from the
+    // ~850 genuinely-reachable types to ~12.8k and surfacing stdlib structs not
+    // actually reachable from typelinks. With the layout fixed, the walk reaches
+    // only legitimately-referenced types.)
+    for expected in [
+        "json:\"name\" yaml:\"name\"",
+        "json:\"enabled\"",
+        "json:\"count,omitempty\"",
+    ] {
+        assert!(
+            all.iter().any(|t| matches!(
+                &t.detail,
+                TypeDetail::Struct { fields, .. }
+                    if fields.iter().any(|f| f.tag == Some(expected))
+            )),
+            "expected the walk to reach a struct carrying tag {expected:?}"
+        );
+    }
 }
 
 #[test]

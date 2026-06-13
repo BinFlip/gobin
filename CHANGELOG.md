@@ -5,6 +5,31 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+### Fixed
+
+Func-type descriptor parsing mislocated the trailing `UncommonType`. The
+`funcType` struct is padded to pointer-size alignment before the inline
+parameter array, but the parser skipped only the bare `FuncTypeExtra` (4
+bytes), landing the `UncommonType` short by the padding. That read a
+garbage `mcount` (up to `0xFFFF` from padding bytes), and resolving those
+phantom methods followed garbage `mtyp` offsets into unrelated
+descriptors — inflating `all_types()` from the ~850 genuinely-reachable
+types to ~12.8k and surfacing stdlib structs not actually reachable from
+typelinks.
+
+- `build_go_type` now accounts for the alignment padding when sizing the
+  `Func` extra (mirroring `descriptor::descriptor_size`), so the
+  `UncommonType` is located correctly.
+- `read_func_params` skips the `UncommonType` block when present, since Go
+  places the inline parameter array *after* it (`abi.FuncType.InSlice`) —
+  keeping the parameter VAs (and the types they reach) correct.
+- `resolve_concrete_methods` / `resolve_interface_methods` now stop on the
+  first empty/unresolved method name rather than fabricating thousands of
+  empty methods when an over-run `mcount`/slice length walks past the real
+  array. Both also drop the speculative `4096`-capacity pre-allocation.
+
 ## [0.3.0]
 
 Go 1.27 support, plus five new extraction surfaces aimed at malware /

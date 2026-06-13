@@ -1092,6 +1092,7 @@ fn build_go_type<'a>(
                     base_sz,
                     f.in_count,
                     f.num_out(),
+                    abi_type.has_uncommon(),
                     ps,
                     legacy,
                     full_data,
@@ -1163,7 +1164,17 @@ fn build_go_type<'a>(
         let extra = match kind {
             TypeKind::Array => ArrayTypeExtra::size(ps),
             TypeKind::Chan => ChanTypeExtra::size(ps),
-            TypeKind::Func => FuncTypeExtra::SIZE,
+            // The `funcType` struct is padded to pointer-size alignment before
+            // the `UncommonType` (the inline parameter array follows it). Using
+            // the bare `FuncTypeExtra::SIZE` here would land the `UncommonType`
+            // parse short by the padding, yielding a garbage `mcount`/`moff`.
+            // Mirror `descriptor::descriptor_size`'s accounting.
+            TypeKind::Func => {
+                match align_up(base_sz.saturating_add(FuncTypeExtra::SIZE), ps as usize) {
+                    Some(off) => off.saturating_sub(base_sz),
+                    None => return None,
+                }
+            }
             TypeKind::Interface => InterfaceTypeExtra::size(ps),
             TypeKind::Map => MapTypeExtra::size(ps),
             TypeKind::Pointer | TypeKind::Slice => ElemTypeExtra::size(ps),
@@ -1237,6 +1248,8 @@ fn build_go_type<'a>(
 /// Layout (after the embedded `abi.Type`):
 /// - 4 bytes: `FuncTypeExtra` (`InCount` u16, `OutCount` u16)
 /// - Padding to pointer-size alignment
+/// - `UncommonType` (16 bytes) when the type carries one — the parameter array
+///   follows it (see `abi.FuncType.InSlice`)
 /// - `(in_count + out_count) * ps` bytes: `*Type` pointers
 ///
 /// Returns `(inputs, outputs)`. Lengths may be shorter than the requested
@@ -1247,6 +1260,7 @@ fn read_func_params<'a>(
     base_sz: usize,
     in_count: u16,
     out_count: u16,
+    has_uncommon: bool,
     ps: u8,
     legacy: bool,
     full_data: &'a [u8],
@@ -1257,10 +1271,15 @@ fn read_func_params<'a>(
     if p == 0 {
         return (Vec::new(), Vec::new());
     }
-    // Params start after FuncTypeExtra (4 bytes), aligned to ptr size.
+    // Params start after the (ptr-aligned) `funcType` struct, then after the
+    // `UncommonType` when present — Go places the inline parameter array *after*
+    // the uncommon block (`abi.FuncType.InSlice`), so skipping it here is what
+    // keeps the parameter VAs (and the types they reach) correct.
+    let uncommon_sz = if has_uncommon { UncommonType::SIZE } else { 0 };
     let params_off = match base_sz
         .checked_add(FuncTypeExtra::SIZE)
         .and_then(|x| align_up(x, p))
+        .and_then(|x| x.checked_add(uncommon_sz))
     {
         Some(o) => o,
         None => return (Vec::new(), Vec::new()),
@@ -1313,7 +1332,7 @@ fn resolve_concrete_methods<'a>(
         Some(s) => s,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(mcount.min(4096));
+    let mut out = Vec::new();
     for i in 0..mcount {
         let off = match i
             .checked_mul(GoMethod::SIZE)
@@ -1326,12 +1345,22 @@ fn resolve_concrete_methods<'a>(
             Some(m) => m,
             None => break,
         };
+        // A concrete-type method always has a name. An empty / unresolved name
+        // means `mcount` over-ran the real method array and the loop is now
+        // reading unrelated bytes — this happens when a stray reference is
+        // mis-parsed as a type descriptor and its `UncommonType.mcount` is
+        // garbage (e.g. `0xFFFF` read from padding). Stop rather than fabricate
+        // thousands of empty methods. `mcount` cannot be bounded by a VA range
+        // here because method arrays may be pooled outside `[types, etypes)`.
         let name_va = (types_base_va as i64).saturating_add(m.name as i64) as u64;
-        let (name, flags): (&'a str, u8) = ctx
+        let (name, flags): (&'a str, u8) = match ctx
             .va_to_file(name_va)
             .and_then(|o| full_data.get(o..))
             .and_then(|d| decode_name_with_flags(d, legacy))
-            .unwrap_or(("", 0));
+        {
+            Some((n, f)) if !n.is_empty() => (n, f),
+            _ => break,
+        };
         let is_exported = (flags & NAME_FLAG_EXPORTED) != 0
             || name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
         // `tfn`/`ifn` are `textOff`s; the linker writes `-1` when the method
@@ -1373,7 +1402,7 @@ fn resolve_interface_methods<'a>(
         Some(b) => b,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(count.min(4096));
+    let mut out = Vec::new();
     for i in 0..count {
         let off = match i.checked_mul(GoImethod::SIZE) {
             Some(o) => o,
@@ -1383,12 +1412,19 @@ fn resolve_interface_methods<'a>(
             Some(im) => im,
             None => break,
         };
+        // An interface method always has a name. An empty / unresolved name
+        // means `methods.len` over-ran the real array into unrelated bytes (a
+        // mis-parsed descriptor with a garbage slice length); stop rather than
+        // fabricate thousands of empty methods.
         let name_va = (types_base_va as i64).saturating_add(im.name as i64) as u64;
-        let name: &'a str = ctx
+        let name: &'a str = match ctx
             .va_to_file(name_va)
             .and_then(|o| full_data.get(o..))
             .and_then(|d| decode_name(d, legacy))
-            .unwrap_or("");
+        {
+            Some(n) if !n.is_empty() => n,
+            _ => break,
+        };
         let type_va = (types_base_va as i64).saturating_add(im.typ as i64) as u64;
         let type_name = resolve_type_name(type_va, full_data, types_base_va, ps, legacy, ctx);
         out.push(InterfaceMethod {
@@ -1422,7 +1458,7 @@ fn resolve_struct_fields<'a>(
         None => return Vec::new(),
     };
     let stride = GoStructField::size(ps);
-    let mut out = Vec::with_capacity(count.min(4096));
+    let mut out = Vec::new();
     for i in 0..count {
         let off = match i.checked_mul(stride) {
             Some(o) => o,
