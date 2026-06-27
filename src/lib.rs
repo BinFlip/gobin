@@ -91,7 +91,7 @@ use crate::{
         Arch, PclntabVersion, buildid, buildinfo, embed, gcprog,
         goslice::{GoSlice, GoStr},
         inittask, inline, itab,
-        moduledata::{ModuleHash, Moduledata, PtabEntry, TextSect},
+        moduledata::{ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect},
         name::decode_name,
         pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
         strings as gostrings, types,
@@ -412,7 +412,15 @@ impl<'a> GoBinary<'a> {
     /// [`Self::entry_rva`] instead, which fold both the `text_va` lookup and
     /// the (PE-only) image-base translation into one accessor.
     pub fn text_va(&self) -> Option<u64> {
-        self.moduledata.as_ref().map(|m| m.text)
+        if let Some(m) = self.moduledata.as_ref() {
+            return Some(m.text);
+        }
+        // Legacy (Go 1.2-1.15) binaries are parsed without a moduledata, and
+        // stripped modern binaries may also lack one. The pclntab records
+        // `runtime.text` directly: for Go 1.2-1.15 it is the first function's
+        // absolute PC, and for Go 1.18+ it is the pcHeader `textStart` field
+        // (both surface as `header_text_start`).
+        self.pclntab().and_then(|p| p.header_text_start)
     }
 
     /// Binary-level virtual address of a function's entry point.
@@ -1301,6 +1309,23 @@ fn find_moduledata_wasm(
     None
 }
 
+/// Validate a scanned moduledata candidate, accounting for the legacy layout.
+///
+/// The modern check requires a non-zero `types` base and a `funcnametab`
+/// pointer that maps into the file. The legacy (Go 1.5-1.15) layout has neither
+/// `funcnametab` nor — before Go 1.7 — a `types` base, so it is validated
+/// through its always-present `text` boundary instead. `minpc < maxpc` guards
+/// both.
+fn moduledata_scan_valid(ctx: &BinaryContext<'_>, md: &Moduledata) -> bool {
+    if md.minpc >= md.maxpc {
+        return false;
+    }
+    match md.version {
+        ModuledataVersion::V1 => md.text != 0 && ctx.va_to_file(md.text).is_some(),
+        _ => md.types != 0 && ctx.va_to_file(md.funcnametab.ptr).is_some(),
+    }
+}
+
 /// Section-less moduledata discovery (PE, and ELF / Mach-O before Go 1.26):
 /// scan file bytes for a pointer-aligned value matching the pclntab VA — the
 /// moduledata's first field is `pcHeader *pcHeader` — then validate by parsing.
@@ -1354,9 +1379,7 @@ fn find_moduledata_by_scan(
                 pclntab.version,
                 has_typelink,
                 go_minor,
-            ) && md.minpc < md.maxpc
-                && md.types != 0
-                && ctx.va_to_file(md.funcnametab.ptr).is_some()
+            ) && moduledata_scan_valid(ctx, &md)
             {
                 return Some(md);
             }

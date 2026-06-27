@@ -11,7 +11,10 @@
 //   - a closure                                               (main.main.func1)
 //   - fmt / strings usage                                     (stdlib packages)
 //
-// Build with -trimpath so no local filesystem paths leak into the binary.
+// The source compiles unchanged on every Go release from 1.2 onward, so one
+// program anchors the whole version matrix; tests/samples/build.sh builds it
+// per version and trims embedded paths. The two exercised methods are marked
+// //go:noinline so their symbols survive the compiler's inliner everywhere.
 package main
 
 import (
@@ -47,6 +50,11 @@ type Config struct {
 }
 
 // DoSomething is a pointer-receiver method: main.(*TestStruct).DoSomething.
+// Marked noinline so the symbol survives on every Go version (the compiler
+// inlines this small method from 1.12 onward); the pragma is a plain comment
+// on pre-1.6 toolchains. Tests assert this method name is recovered everywhere.
+//
+//go:noinline
 func (t *TestStruct) DoSomething() string {
 	return fmt.Sprintf("%s:%d", t.Name, t.Count)
 }
@@ -64,6 +72,8 @@ type OtherImpl struct{ x int }
 func (o OtherImpl) Greet() string { return strings.Repeat("yo", o.x) }
 
 // worker runs on its own goroutine, defers a close, and sends on a channel.
+//
+//go:noinline
 func worker(ch chan int, n int) {
 	defer close(ch)
 	ch <- n * 2

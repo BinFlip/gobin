@@ -89,12 +89,33 @@
 //! The functab has `nfunc + 1` entries (the last contains only an end-PC sentinel).
 //!
 //! Source: `src/runtime/symtab.go:579-582`
+//!
+//! ## Legacy Layout (Go 1.2-1.15)
+//!
+//! Binaries built with Go 1.2 through 1.15 use magic `0xfffffffb`
+//! ([`PclntabVersion::Go12`]) and a markedly different layout with **no**
+//! structured `pcHeader`, `funcnametab`, `cutab`, or `pctab`:
+//!
+//! - The 8-byte prefix (`magic`, two pad bytes, `minLC`, `ptrSize`) is followed
+//!   immediately by a pointer-sized `nfunctab` and then the functab.
+//! - functab entries are pointer-sized `(entry, funcoff)` pairs holding
+//!   *absolute* PCs (like Go 1.16-1.17); `funcoff` is relative to the pcHeader.
+//! - A `u32` after the functab points to the filetab, which is a `[]uint32`
+//!   (slot 0 = count, later slots = pcHeader-relative path offsets).
+//! - `_func.nameOff`, `pcsp`, `pcfile`, and `pcln` are all offsets relative to
+//!   the pcHeader, not to separate sub-tables.
+//!
+//! This format is parsed by `parse_header_go12`; see its docs and
+//! `func_layout` for the precise field offsets.
+//!
+//! Source: `src/debug/gosym/pclntab.go` (`go12Init`),
+//! `src/runtime/symtab.go` (Go 1.2-1.15).
 
 use crate::{
     formats::{BinaryContext, BinaryFormat, GoSections},
     structures::{
         Arch, PclntabVersion,
-        util::{advance_n, read_uintptr, read_uvarint, slice_at},
+        util::{advance, advance_n, read_uintptr, read_uvarint, slice_at},
     },
 };
 
@@ -313,22 +334,39 @@ impl<'a> ParsedPclntab<'a> {
         }
     }
 
+    /// Base offset within [`Self::data`] that a functab entry's `funcoff` is
+    /// measured from.
+    ///
+    /// In Go 1.16+, `funcoff` is relative to the functab section start
+    /// ([`Self::functab_offset`]) — the `_func` structs sit there, after the
+    /// `(nfunc+1)` entry pairs. In Go 1.2-1.15 there is no separate functab
+    /// section: `funcoff` is an offset from the pcHeader itself (`data[0]`), so
+    /// the base is `0`.
+    ///
+    /// Source: `src/debug/gosym/pclntab.go` (`go12Init` indexes `t.Data`).
+    fn func_struct_base(&self) -> usize {
+        match self.version {
+            PclntabVersion::Go12 => 0,
+            _ => self.functab_offset,
+        }
+    }
+
     /// Parse the `_func` struct at the given `funcoff` from a functab entry.
     ///
-    /// In Go 1.16+, `funcoff` is relative to the functab section start (not
-    /// to the pcHeader). The _func structs are stored within the functab section
-    /// after the `(nfunc+1)` entry pairs. Thus the absolute offset within pclntab
-    /// data is `functab_offset + funcoff`.
+    /// `funcoff` is resolved against `func_struct_base`, which differs between
+    /// the legacy (Go 1.2-1.15, pcHeader-relative) and modern (Go 1.16+,
+    /// functab-section-relative) layouts.
     ///
-    /// Source: `src/runtime/runtime2.go:1074-1099`
+    /// Source: `src/runtime/runtime2.go:1074-1099` (modern `_func`),
+    /// `src/debug/gosym/pclntab.go` (`funcData`, legacy `_func`).
     pub fn parse_func(&self, func_off: u32) -> Option<FuncData> {
-        let off = self.functab_offset.checked_add(func_off as usize)?;
+        let off = self.func_struct_base().checked_add(func_off as usize)?;
         let d = self.data.get(off..)?;
         let lay = func_layout(self.version, self.ptr_size);
         if d.len() < lay.size {
             return None;
         }
-        // Go 1.16-1.17 store an absolute PC; rebase to an offset like 1.18+.
+        // Go 1.2-1.17 store an absolute PC; rebase to an offset like 1.18+.
         let entry_off = if lay.entry_is_abs {
             let abs = read_uintptr(d, 0, self.ptr_size)?;
             u32::try_from(abs.saturating_sub(self.text_start)).unwrap_or(u32::MAX)
@@ -343,6 +381,19 @@ impl<'a> ParsedPclntab<'a> {
             Some(o) => *d.get(o)?,
             None => 0,
         };
+        // Optional in the legacy layout (no cutab / pre-1.12 funcID); read as 0.
+        let cu_offset = match lay.cu_offset {
+            Some(o) => u32::from_le_bytes(slice_at::<4>(d, o)?),
+            None => 0,
+        };
+        let func_id = match lay.func_id {
+            Some(o) => *d.get(o)?,
+            None => 0,
+        };
+        let nfuncdata = match lay.nfuncdata {
+            Some(o) => *d.get(o)?,
+            None => 0,
+        };
         Some(FuncData {
             func_off,
             entry_off,
@@ -353,11 +404,11 @@ impl<'a> ParsedPclntab<'a> {
             pcfile: u32::from_le_bytes(slice_at::<4>(d, lay.pcfile)?),
             pcln: u32::from_le_bytes(slice_at::<4>(d, lay.pcln)?),
             npcdata: u32::from_le_bytes(slice_at::<4>(d, lay.npcdata)?),
-            cu_offset: u32::from_le_bytes(slice_at::<4>(d, lay.cu_offset)?),
+            cu_offset,
             start_line,
-            func_id: *d.get(lay.func_id)?,
+            func_id,
             flag,
-            nfuncdata: *d.get(lay.nfuncdata)?,
+            nfuncdata,
         })
     }
 
@@ -370,7 +421,7 @@ impl<'a> ParsedPclntab<'a> {
             return None;
         }
         let base = self
-            .functab_offset
+            .func_struct_base()
             .checked_add(func.func_off as usize)?
             .checked_add(func_layout(self.version, self.ptr_size).size)?;
         let pos = base.checked_add((i as usize).checked_mul(4)?)?;
@@ -388,7 +439,7 @@ impl<'a> ParsedPclntab<'a> {
             return None;
         }
         let base = self
-            .functab_offset
+            .func_struct_base()
             .checked_add(func.func_off as usize)?
             .checked_add(func_layout(self.version, self.ptr_size).size)?;
         let pcdata_bytes = (func.npcdata as usize).checked_mul(4)?;
@@ -482,7 +533,20 @@ impl<'a> ParsedPclntab<'a> {
     /// "where does this function start in source?" use case.
     pub fn resolve_source_file(&self, func: &FuncData) -> Option<&'a str> {
         let (_, idx) = self.decode_pcfile(func).next()?;
-        self.resolve_file_via_cu(func.cu_offset, idx)
+        self.resolve_file_index(func.cu_offset, idx)
+    }
+
+    /// Resolve a `pcfile` file index to its source path, dispatching on the
+    /// pclntab format.
+    ///
+    /// - **Go 1.16+** routes through the cutab via [`Self::resolve_file_via_cu`].
+    /// - **Go 1.2-1.15** has no cutab; the index addresses the `[]uint32`
+    ///   filetab directly via [`Self::resolve_file_go12`] (`cu_offset` unused).
+    pub fn resolve_file_index(&self, cu_offset: u32, file_idx: u32) -> Option<&'a str> {
+        match self.version {
+            PclntabVersion::Go12 => self.resolve_file_go12(file_idx),
+            _ => self.resolve_file_via_cu(cu_offset, file_idx),
+        }
     }
 
     /// Resolve a file index through the cutab to get a filetab offset, then
@@ -499,6 +563,29 @@ impl<'a> ParsedPclntab<'a> {
         let cu_pos = self.cu_offset.checked_add(byte_offset)?;
         let file_off = u32::from_le_bytes(slice_at::<4>(self.data, cu_pos)?);
         self.file_name(file_off)
+    }
+
+    /// Resolve a file index for the legacy (Go 1.2-1.15) `[]uint32` filetab.
+    ///
+    /// The legacy filetab is an array of `u32` where slot `0` holds the entry
+    /// count and slot `n` (`n >= 1`) holds the pcHeader-relative offset of the
+    /// `n`-th null-terminated file path. The `pcfile` PC-value table yields the
+    /// `n` directly, so `path_off = filetab[file_idx]`.
+    ///
+    /// Source: `src/debug/gosym/pclntab.go`
+    /// (`t.string(t.binary.Uint32(t.filetab[4*fno:]))`).
+    pub fn resolve_file_go12(&self, file_idx: u32) -> Option<&'a str> {
+        // Slot 0 is the count, not a path; a 0 index means "no file".
+        if file_idx == 0 {
+            return None;
+        }
+        let entry_pos = self
+            .filetab_offset
+            .checked_add((file_idx as usize).checked_mul(4)?)?;
+        let path_off = u32::from_le_bytes(slice_at::<4>(self.data, entry_pos)?) as usize;
+        let remaining = self.data.get(path_off..)?;
+        let end = remaining.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(remaining.get(..end)?).ok()
     }
 
     /// Get the line number range for a function: `(start_line, end_line)`.
@@ -528,14 +615,26 @@ impl<'a> ParsedPclntab<'a> {
 
     /// Iterate over all source file paths in the filetab.
     ///
-    /// The filetab is a sequence of null-terminated strings. Yields each
-    /// non-empty valid UTF-8 entry as a borrowed `&str`.
+    /// Yields each non-empty valid UTF-8 entry as a borrowed `&str`. The
+    /// underlying encoding is version-dependent:
+    ///
+    /// - **Go 1.16+**: the filetab is a contiguous block of null-terminated
+    ///   strings, walked in place.
+    /// - **Go 1.2-1.15**: the filetab is a `[]uint32` whose slot `0` is the
+    ///   entry count and whose remaining slots are pcHeader-relative offsets to
+    ///   null-terminated strings; each slot is dereferenced.
     pub fn file_names(&self) -> FileNameIter<'a> {
-        let filetab_data = self.data.get(self.filetab_offset..).unwrap_or(&[]);
+        let kind = match self.version {
+            PclntabVersion::Go12 => FileTabKind::U32Array,
+            _ => FileTabKind::NullTerminated,
+        };
         FileNameIter {
-            data: filetab_data,
+            data: self.data,
+            filetab_offset: self.filetab_offset,
+            kind,
             pos: 0,
-            remaining: self.nfiles,
+            index: 1,
+            count: self.nfiles,
         }
     }
 }
@@ -597,22 +696,85 @@ impl Iterator for FuncEntryIter<'_> {
 
 impl ExactSizeIterator for FuncEntryIter<'_> {}
 
-/// Streaming iterator over filetab null-terminated file name strings.
+/// On-disk encoding of the filetab, which [`FileNameIter`] walks differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTabKind {
+    /// Go 1.16+: a contiguous run of null-terminated path strings.
+    NullTerminated,
+    /// Go 1.2-1.15: a `[]uint32` of pcHeader-relative path offsets (slot 0 is
+    /// the entry count).
+    U32Array,
+}
+
+/// Streaming iterator over filetab file-name strings.
+///
+/// Handles both the modern null-terminated filetab and the legacy
+/// (Go 1.2-1.15) `[]uint32` offset table; see [`ParsedPclntab::file_names`].
 pub struct FileNameIter<'a> {
+    /// Full pclntab data, starting at the pcHeader.
     data: &'a [u8],
+    /// Offset of the filetab within [`Self::data`].
+    filetab_offset: usize,
+    /// Which encoding [`Self::data`]'s filetab uses.
+    kind: FileTabKind,
+    /// Byte cursor within the filetab (for [`FileTabKind::NullTerminated`]).
     pos: usize,
-    remaining: usize,
+    /// Current `[]uint32` slot (for [`FileTabKind::U32Array`]); slot 0 is the
+    /// count, so iteration starts at 1.
+    index: usize,
+    /// Total entry count (`nfiles`), used as the iteration bound.
+    count: usize,
 }
 
 impl<'a> Iterator for FileNameIter<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.remaining > 0 && self.pos < self.data.len() {
-            let rest = self.data.get(self.pos..)?;
+        match self.kind {
+            FileTabKind::NullTerminated => self.next_null_terminated(),
+            FileTabKind::U32Array => self.next_u32_array(),
+        }
+    }
+}
+
+impl<'a> FileNameIter<'a> {
+    /// Yield the next null-terminated path (Go 1.16+ filetab).
+    fn next_null_terminated(&mut self) -> Option<&'a str> {
+        let tab = self.data.get(self.filetab_offset..)?;
+        while self.count > 0 && self.pos < tab.len() {
+            let rest = tab.get(self.pos..)?;
             let end = rest.iter().position(|&b| b == 0)?;
-            self.remaining = self.remaining.checked_sub(1)?;
+            self.count = self.count.checked_sub(1)?;
             self.pos = self.pos.checked_add(end)?.checked_add(1)?;
+            if end > 0
+                && let Some(name_bytes) = rest.get(..end)
+                && let Ok(name) = std::str::from_utf8(name_bytes)
+            {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Yield the next path dereferenced through the `[]uint32` offset table
+    /// (Go 1.2-1.15 filetab).
+    fn next_u32_array(&mut self) -> Option<&'a str> {
+        while self.index < self.count {
+            let slot = self.index;
+            self.index = self.index.checked_add(1)?;
+            let entry_pos = self.filetab_offset.checked_add(slot.checked_mul(4)?)?;
+            let path_off = match slice_at::<4>(self.data, entry_pos) {
+                Some(b) => u32::from_le_bytes(b) as usize,
+                None => continue,
+            };
+            let rest = match self.data.get(path_off..) {
+                Some(r) => r,
+                None => continue,
+            };
+            let end = match rest.iter().position(|&b| b == 0) {
+                Some(e) => e,
+                None => continue,
+            };
             if end > 0
                 && let Some(name_bytes) = rest.get(..end)
                 && let Ok(name) = std::str::from_utf8(name_bytes)
@@ -745,7 +907,7 @@ impl<'a> Iterator for PcFilePathIter<'_, 'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (pc, idx) = self.inner.next()?;
-            if let Some(path) = self.pcl.resolve_file_via_cu(self.cu_offset, idx) {
+            if let Some(path) = self.pcl.resolve_file_index(self.cu_offset, idx) {
                 return Some((pc, path));
             }
         }
@@ -808,7 +970,7 @@ impl<'a> Iterator for PcLineFileIter<'_, 'a> {
                 Some(t) => *t,
                 None => continue,
             };
-            match self.pcl.resolve_file_via_cu(self.cu_offset, file_idx) {
+            match self.pcl.resolve_file_index(self.cu_offset, file_idx) {
                 Some(path) => return Some((pc, line, path)),
                 None => continue,
             }
@@ -1357,6 +1519,11 @@ fn parse_header(
     base_offset: usize,
     version: PclntabVersion,
 ) -> Option<ParsedPclntab<'_>> {
+    // The Go 1.2-1.15 pclntab has no structured pcHeader — a different parser.
+    if version == PclntabVersion::Go12 {
+        return parse_header_go12(data, base_offset);
+    }
+
     // Validate padding bytes (must be zero)
     if *data.get(4)? != 0 || *data.get(5)? != 0 {
         return None;
@@ -1374,7 +1541,7 @@ fn parse_header(
     // omit it, so their offset fields (funcnameOffset..pclnOffset) sit one
     // pointer slot earlier.
     let off_base: usize = match version {
-        PclntabVersion::Go12 | PclntabVersion::Go116 => 2,
+        PclntabVersion::Go116 => 2,
         _ => 3,
     };
     let header_size = advance_n(8, off_base.saturating_add(5), ps)?;
@@ -1410,9 +1577,7 @@ fn parse_header(
     // (lowest) function's PC so we can present relative `entry_off`s like newer
     // versions do. Go 1.18+ already stores offsets, so this stays 0.
     let text_start = match version {
-        PclntabVersion::Go12 | PclntabVersion::Go116 => {
-            read_uintptr(data, functab_offset, ptr_size).unwrap_or(0)
-        }
+        PclntabVersion::Go116 => read_uintptr(data, functab_offset, ptr_size).unwrap_or(0),
         _ => 0,
     };
 
@@ -1443,11 +1608,108 @@ fn parse_header(
     })
 }
 
+/// Parse the legacy (Go 1.2-1.15) pclntab header.
+///
+/// Unlike Go 1.16+, the legacy format has no structured `pcHeader`: the 8-byte
+/// prefix (`magic`, two pad bytes, `minLC`, `ptrSize`) is followed immediately
+/// by a pointer-sized `nfunctab` and the functab itself. There is no separate
+/// `funcnametab`, `cutab`, or `pctab` — function names and the `pcsp`/`pcfile`/
+/// `pcln` tables are addressed by offsets relative to the pcHeader (`data[0]`),
+/// so [`ParsedPclntab::funcname_offset`] and [`ParsedPclntab::pctab_offset`]
+/// are both `0`. The filetab is located by a `u32` stored immediately after the
+/// functab and is itself a `[]uint32` (slot 0 = count, later slots = path
+/// offsets), so [`ParsedPclntab::cu_offset`] is unused.
+///
+/// Layout:
+///
+/// ```text
+/// 0        4        magic (0xfffffffb)
+/// 4        2        pad (0, 0)
+/// 6        1        minLC
+/// 7        1        ptrSize
+/// 8        ptrSize  nfunctab
+/// 8+ps     ...      functab: (2*nfunctab + 1) * ptrSize bytes
+///                   = nfunctab (entry, funcoff) uintptr pairs + 1 end-PC
+/// +functabsize  4   fileoff (u32): pcHeader-relative offset to the filetab
+/// fileoff  4        nfiletab (u32), then (nfiletab-1) u32 path offsets
+/// ```
+///
+/// Source: `src/debug/gosym/pclntab.go` (`go12Init`),
+/// `src/runtime/symtab.go` (Go 1.2-1.15 `pclntab` layout).
+fn parse_header_go12(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
+    // Pad bytes must be zero; minLC/ptrSize must be in range. The legacy parser
+    // in debug/gosym requires at least 16 bytes (header + nfunctab).
+    if data.len() < 16 || *data.get(4)? != 0 || *data.get(5)? != 0 {
+        return None;
+    }
+    let min_lc = *data.get(6)?;
+    let ptr_size = *data.get(7)?;
+    if !matches!(min_lc, 1 | 2 | 4) || !matches!(ptr_size, 4 | 8) {
+        return None;
+    }
+    let ps = ptr_size as usize;
+
+    // nfunctab: pointer-sized count at offset 8.
+    let nfunctab = usize::try_from(read_uintptr(data, 8, ptr_size)?).ok()?;
+    if nfunctab == 0 || nfunctab > 10_000_000 {
+        return None;
+    }
+
+    // functab starts right after nfunctab and spans (2*nfunctab + 1) uintptrs:
+    // nfunctab (entry, funcoff) pairs plus a trailing end-PC sentinel.
+    let functab_offset = advance(8, ps)?;
+    let functab_words = nfunctab.checked_mul(2)?.checked_add(1)?;
+    let functab_size = functab_words.checked_mul(ps)?;
+
+    // The filetab offset is a u32 stored immediately after the functab.
+    let fileoff_pos = functab_offset.checked_add(functab_size)?;
+    let filetab_offset = u32::from_le_bytes(slice_at::<4>(data, fileoff_pos)?) as usize;
+    if filetab_offset == 0 || filetab_offset >= data.len() {
+        return None;
+    }
+
+    // filetab[0] is the entry count (including itself); later slots are path
+    // offsets resolved by `resolve_file_go12`.
+    let nfiletab = u32::from_le_bytes(slice_at::<4>(data, filetab_offset)?) as usize;
+    if nfiletab > 10_000_000 {
+        return None;
+    }
+
+    // The first functab entry's absolute PC is the lowest function address,
+    // i.e. `runtime.text`. Record it so `entry_off` can be presented relative
+    // to text (matching newer versions) and so `text_va` can recover the base
+    // even though the legacy moduledata is parsed separately.
+    let text_start = read_uintptr(data, functab_offset, ptr_size)?;
+
+    Some(ParsedPclntab {
+        data,
+        offset: base_offset,
+        version: PclntabVersion::Go12,
+        min_lc,
+        ptr_size,
+        nfunc: nfunctab,
+        nfiles: nfiletab,
+        // Names are pcHeader-relative (`nameoff` indexes `data` from 0).
+        funcname_offset: 0,
+        // No cutab in the legacy format.
+        cu_offset: 0,
+        filetab_offset,
+        // pcsp/pcfile/pcln are pcHeader-relative offsets, not pctab indices.
+        pctab_offset: 0,
+        functab_offset,
+        text_start,
+        header_text_start: Some(text_start),
+    })
+}
+
 /// Byte offsets of the fields within a `_func` struct, which changed shape
 /// across Go versions:
 ///
-/// - **Go 1.16-1.17**: leads with an absolute `entry uintptr`; no `startLine`,
-///   no `flag`. Size `ptrSize + 36`.
+/// - **Go 1.2-1.15**: leads with an absolute `entry uintptr`; no `cuOffset`,
+///   no `startLine`, no `flag`. `funcID` only exists from Go 1.12, so it is
+///   read defensively (`None` for this layout). Size `ptrSize + 32`.
+/// - **Go 1.16-1.17**: leads with an absolute `entry uintptr`; adds `cuOffset`
+///   and `funcID`; no `startLine`, no `flag`. Size `ptrSize + 36`.
 /// - **Go 1.18-1.19**: `u32` `entryoff`; adds `flag`; still no `startLine`.
 ///   Size `40`.
 /// - **Go 1.20+**: adds `startLine`. Size `44`.
@@ -1456,7 +1718,7 @@ struct FuncLayout {
     /// Total struct size — the stride before the `pcdata`/`funcdata` arrays.
     size: usize,
     /// Whether the leading `entry` field is a pointer-sized absolute PC
-    /// (Go 1.16-1.17) rather than a `u32` offset.
+    /// (Go 1.2-1.17) rather than a `u32` offset.
     entry_is_abs: bool,
     name_off: usize,
     args: usize,
@@ -1465,20 +1727,52 @@ struct FuncLayout {
     pcfile: usize,
     pcln: usize,
     npcdata: usize,
-    cu_offset: usize,
+    /// `cuOffset` offset (Go 1.16+), else `None` — Go 1.2-1.15 has no cutab and
+    /// resolves files directly through the `[]uint32` filetab (read as 0).
+    cu_offset: Option<usize>,
     /// `startLine` offset (Go 1.20+), else `None` (read as 0).
     start_line: Option<usize>,
-    func_id: usize,
+    /// `funcID` offset, else `None` (read as 0). Absent before Go 1.12; left
+    /// `None` for the Go 1.2-1.15 layout since the magic alone cannot tell
+    /// pre-1.12 from 1.12-1.15 apart and the field is non-critical.
+    func_id: Option<usize>,
     /// `flag` offset (Go 1.18+), else `None` (read as 0).
     flag: Option<usize>,
-    nfuncdata: usize,
+    /// `nfuncdata` offset, else `None` (read as 0). The Go 1.2-1.15 `_func`
+    /// stores `pcsp`/`pcfile`/`pcln` as direct pclntab offsets rather than
+    /// `pcdata[]` indices, so its `funcdata[]` array is not consumed here.
+    nfuncdata: Option<usize>,
 }
 
 fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
     let p = ptr_size as usize;
     match version {
-        // Go 1.16-1.17 (and the legacy Go12 path): entry uintptr @0.
-        PclntabVersion::Go12 | PclntabVersion::Go116 => FuncLayout {
+        // Go 1.2-1.15: entry uintptr @0; no cuOffset. The fixed fields end at
+        // npcdata (@p+24); funcID (Go 1.12+) and nfuncdata follow but their
+        // exact positions vary within the range and they are non-critical, so
+        // they are left `None`. Stride to the trailing pcdata/funcdata arrays
+        // is `p + 32` (`npcdata` + `funcID`/pad + `nfuncdata`).
+        //
+        // Source: `src/debug/gosym/pclntab.go` (`go12Init`/`funcData`),
+        // `src/runtime/runtime2.go` `_func` (Go 1.2-1.15).
+        PclntabVersion::Go12 => FuncLayout {
+            size: p.saturating_add(32),
+            entry_is_abs: true,
+            name_off: p,
+            args: p.saturating_add(4),
+            deferreturn: p.saturating_add(8),
+            pcsp: p.saturating_add(12),
+            pcfile: p.saturating_add(16),
+            pcln: p.saturating_add(20),
+            npcdata: p.saturating_add(24),
+            cu_offset: None,
+            start_line: None,
+            func_id: None,
+            flag: None,
+            nfuncdata: None,
+        },
+        // Go 1.16-1.17: entry uintptr @0; +cuOffset, +funcID.
+        PclntabVersion::Go116 => FuncLayout {
             size: p.saturating_add(36),
             entry_is_abs: true,
             name_off: p,
@@ -1488,11 +1782,11 @@ fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
             pcfile: p.saturating_add(16),
             pcln: p.saturating_add(20),
             npcdata: p.saturating_add(24),
-            cu_offset: p.saturating_add(28),
+            cu_offset: Some(p.saturating_add(28)),
             start_line: None,
-            func_id: p.saturating_add(32),
+            func_id: Some(p.saturating_add(32)),
             flag: None,
-            nfuncdata: p.saturating_add(35),
+            nfuncdata: Some(p.saturating_add(35)),
         },
         // Go 1.18-1.19: u32 entryoff @0, +flag, no startLine.
         PclntabVersion::Go118 => FuncLayout {
@@ -1505,11 +1799,11 @@ fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
             pcfile: 20,
             pcln: 24,
             npcdata: 28,
-            cu_offset: 32,
+            cu_offset: Some(32),
             start_line: None,
-            func_id: 36,
+            func_id: Some(36),
             flag: Some(37),
-            nfuncdata: 39,
+            nfuncdata: Some(39),
         },
         // Go 1.20+: +startLine.
         PclntabVersion::Go120 => FuncLayout {
@@ -1522,11 +1816,11 @@ fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
             pcfile: 20,
             pcln: 24,
             npcdata: 28,
-            cu_offset: 32,
+            cu_offset: Some(32),
             start_line: Some(36),
-            func_id: 40,
+            func_id: Some(40),
             flag: Some(41),
-            nfuncdata: 43,
+            nfuncdata: Some(43),
         },
     }
 }
@@ -1708,5 +2002,125 @@ mod tests {
         let parsed = result.unwrap();
         assert_eq!(parsed.offset, 0);
         assert_eq!(parsed.nfunc, FUNCTAB_MIN_RUN);
+    }
+
+    /// Build a synthetic legacy (Go 1.2-1.15, magic `0xfffffffb`) pclntab for a
+    /// 64-bit x86 target with two functions and two source files.
+    ///
+    /// The byte layout mirrors `debug/gosym`'s `go12Init`: an 8-byte header, a
+    /// pointer-sized `nfunctab`, a `(2*nfunctab + 1)`-uintptr functab holding
+    /// absolute PCs, a trailing `u32` filetab offset, and a `[]uint32` filetab
+    /// whose slot 0 is the count. Names and file paths are null-terminated
+    /// strings addressed by pcHeader-relative offsets.
+    fn build_synthetic_go12_pclntab() -> Vec<u8> {
+        let mut data = vec![0u8; 4096];
+        let put_u64 = |d: &mut [u8], off: usize, v: u64| {
+            d[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u32 = |d: &mut [u8], off: usize, v: u32| {
+            d[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_str = |d: &mut [u8], off: usize, s: &str| {
+            d[off..off + s.len()].copy_from_slice(s.as_bytes());
+            d[off + s.len()] = 0;
+        };
+
+        // Header: magic + pad + minLC=1 (x86) + ptrSize=8.
+        data[0..4].copy_from_slice(&[0xfb, 0xff, 0xff, 0xff]);
+        data[6] = 1;
+        data[7] = 8;
+
+        // nfunctab @8; functab @16.
+        put_u64(&mut data, 8, 2);
+        let text = 0x1000u64;
+        put_u64(&mut data, 16, text); // entry0 (absolute)
+        put_u64(&mut data, 24, 100); // funcoff0 (pcHeader-relative)
+        put_u64(&mut data, 32, 0x1100); // entry1
+        put_u64(&mut data, 40, 150); // funcoff1
+        put_u64(&mut data, 48, 0x1200); // maxpc sentinel
+
+        // fileoff u32 right after the functab ((2*2+1)*8 = 40 bytes from @16).
+        put_u32(&mut data, 56, 300);
+        // filetab []uint32 @300: slot0=count(3), slot1/2 = path offsets.
+        put_u32(&mut data, 300, 3);
+        put_u32(&mut data, 304, 400);
+        put_u32(&mut data, 308, 420);
+
+        // Name strings (nameoff is pcHeader-relative).
+        put_str(&mut data, 200, "main.main");
+        put_str(&mut data, 230, "main.worker");
+        // File path strings.
+        put_str(&mut data, 400, "/src/main.go");
+        put_str(&mut data, 420, "/src/util.go");
+
+        // _func0 @100: entry uintptr + nameoff i32 @ ptrSize.
+        put_u64(&mut data, 100, text);
+        put_u32(&mut data, 108, 200);
+        // _func1 @150.
+        put_u64(&mut data, 150, 0x1100);
+        put_u32(&mut data, 158, 230);
+
+        data
+    }
+
+    #[test]
+    fn go12_header_parses_legacy_layout() {
+        let data = build_synthetic_go12_pclntab();
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).expect("legacy pclntab should parse");
+
+        assert_eq!(p.version, PclntabVersion::Go12);
+        assert_eq!(p.min_lc, 1);
+        assert_eq!(p.ptr_size, 8);
+        assert_eq!(p.arch(), Arch::X86_64);
+        assert_eq!(p.nfunc, 2);
+        assert_eq!(p.nfiles, 3); // includes the count slot
+        // funcname/pctab tables are pcHeader-relative in the legacy layout.
+        assert_eq!(p.funcname_offset, 0);
+        assert_eq!(p.pctab_offset, 0);
+        assert_eq!(p.functab_offset, 16);
+        assert_eq!(p.filetab_offset, 300);
+        // runtime.text recovered from the first function's absolute PC.
+        assert_eq!(p.text_start, 0x1000);
+        assert_eq!(p.header_text_start, Some(0x1000));
+    }
+
+    #[test]
+    fn go12_func_entries_and_names() {
+        let data = build_synthetic_go12_pclntab();
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).unwrap();
+
+        let entries: Vec<(u32, u32)> = p.func_entries().collect();
+        // entry_off is rebased against text_start (0x1000); funcoff is
+        // pcHeader-relative.
+        assert_eq!(entries, vec![(0x0, 100), (0x100, 150)]);
+
+        let f0 = p.parse_func(100).expect("func0");
+        assert_eq!(f0.entry_off, 0);
+        assert_eq!(f0.name_off, 200);
+        assert_eq!(p.func_name(f0.name_off as u32), Some("main.main"));
+
+        let f1 = p.parse_func(150).expect("func1");
+        assert_eq!(f1.entry_off, 0x100);
+        assert_eq!(p.func_name(f1.name_off as u32), Some("main.worker"));
+    }
+
+    #[test]
+    fn go12_filetab_is_u32_array() {
+        let data = build_synthetic_go12_pclntab();
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).unwrap();
+
+        // file_names walks the []uint32 offset table, dereferencing each slot.
+        let files: Vec<&str> = p.file_names().collect();
+        assert_eq!(files, vec!["/src/main.go", "/src/util.go"]);
+
+        // Direct index resolution: slot 0 is the count (no file), 1.. are paths.
+        assert_eq!(p.resolve_file_go12(0), None);
+        assert_eq!(p.resolve_file_go12(1), Some("/src/main.go"));
+        assert_eq!(p.resolve_file_go12(2), Some("/src/util.go"));
+        // resolve_file_index dispatches to the legacy resolver for Go12.
+        assert_eq!(p.resolve_file_index(0, 1), Some("/src/main.go"));
     }
 }

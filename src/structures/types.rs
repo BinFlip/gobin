@@ -40,7 +40,7 @@ use crate::{
         maptype::MapTypeExtra,
         method::GoImethod,
         method::GoMethod,
-        moduledata::Moduledata,
+        moduledata::{Moduledata, ModuledataVersion},
         name::{
             NAME_FLAG_EMBEDDED, NAME_FLAG_EXPORTED, decode_name, decode_name_and_tag,
             decode_name_with_flags,
@@ -786,9 +786,6 @@ fn discover_moduledata_via_pcheader(
 ) -> Option<Moduledata> {
     let data = ctx.structure_search_data();
     let pclntab_off = pclntab_offset?;
-    // For wasm the pclntab "offset" already IS its linear-memory address (the
-    // pcHeader was discovered inside the LM image). For PE, translate via
-    // segments.
     let pclntab_va = if ctx.format() == BinaryFormat::Wasm {
         pclntab_off as u64
     } else {
@@ -812,7 +809,7 @@ fn discover_moduledata_via_pcheader(
         if end > data.len() {
             break;
         }
-        // Align to pointer size
+
         let rem = offset.checked_rem(p).unwrap_or(0);
         if rem != 0 {
             let bump = p.saturating_sub(rem);
@@ -824,18 +821,16 @@ fn discover_moduledata_via_pcheader(
         }
 
         if data.get(offset..end) == Some(target_bytes.as_slice()) {
-            // Candidate moduledata at `offset`. Validate by parsing.
             let remaining = match data.get(offset..) {
                 Some(r) => r,
                 None => break,
             };
             if let Some(md) = Moduledata::parse(remaining, ps, pv, has_typelink, go_version_minor) {
-                // Sanity checks: PC bounds non-empty, type region present,
-                // and funcnametab pointer resolvable.
-                if md.minpc < md.maxpc
-                    && md.types != 0
-                    && ctx.va_to_file(md.funcnametab.ptr).is_some()
-                {
+                let anchored = match md.version {
+                    ModuledataVersion::V1 => md.text != 0 && ctx.va_to_file(md.text).is_some(),
+                    _ => md.types != 0 && ctx.va_to_file(md.funcnametab.ptr).is_some(),
+                };
+                if md.minpc < md.maxpc && anchored {
                     return Some(md);
                 }
             }

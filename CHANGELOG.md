@@ -5,6 +5,35 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+### Added
+
+Support for the legacy Go 1.2–1.15 binary layout, which previously parsed as
+garbage (a Go 1.9.x binary produced millions of bogus source-file names and
+unprintable "package" strings). The pre-1.16 pclntab and moduledata are
+genuinely different structures, now parsed natively:
+
+- `pclntab::parse_header_go12` handles the legacy "Go 1.2" pclntab (magic
+  `0xfffffffb`): an 8-byte header (no structured `pcHeader`), a pointer-sized
+  functab of absolute PCs, and the `[]uint32` `filetab` — the table that
+  previously misparsed into millions of entries. Function names and the
+  `pcsp`/`pcfile`/`pcln` tables are pcHeader-relative; `text_va` is recovered
+  from the lowest function PC when no moduledata is present.
+- `Moduledata::parse_go12_legacy` parses the V1 moduledata (Go 1.5–1.15) with
+  per-minor field gating verified against `runtime/symtab.go`: `itablinks`
+  (1.6), `types`/`typelinks []int32`/`typemap` (1.7), plugin fields (1.8),
+  `hasmain`/`bad` (1.10). Go 1.2–1.4 have no moduledata and are left as such.
+  The moduledata locators (in `lib` and `types`) validate the legacy layout
+  through its `text` boundary, since it has no `funcnametab`.
+
+Test infrastructure was consolidated and broadened: a single self-contained
+`tests/samples/build.sh` builds a per-version fixture matrix spanning Go 1.2
+through 1.27 across ELF / Mach-O / PE / Wasm, plus new `types`, `generics`, and
+`cgo` harnesses that exercise the type-descriptor zoo, generic instantiations,
+and CGO surfaces. The `mod matrix` / `mod harness` integration tests assert the
+per-version pclntab and moduledata layouts and the advanced-feature extraction.
+
 ## [0.3.1]
 
 ### Fixed
@@ -550,6 +579,9 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
+[0.4.0]: https://github.com/BinFlip/gobin/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/BinFlip/gobin/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/BinFlip/gobin/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/BinFlip/gobin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/BinFlip/gobin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BinFlip/gobin/releases/tag/v0.1.0

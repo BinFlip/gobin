@@ -8,12 +8,13 @@
 //!
 //! | Variant | Go Versions | Key Differences                                    |
 //! |---------|-------------|----------------------------------------------------|
-//! | V2      | 1.16-1.17   | No rodata/gofunc, covctrs, inittasks, epclntab     |
+//! | V1      | 1.5-1.15    | Legacy "Go 1.2" pclntab: no `pcHeader`/`funcnametab`/`cutab`/`pctab`; `pclntable` is the whole pclntab; `[]uint32` `filetab`. `types`/`typelinks []int32` from 1.7; `itablinks` from 1.6; plugin fields from 1.8; `hasmain`/`bad` from 1.10 |
+//! | V2      | 1.16-1.17   | New `pcHeader`; no rodata/gofunc, covctrs, inittasks, epclntab |
 //! | V3      | 1.18-1.25   | +rodata/gofunc; +covctrs (1.20+); +inittasks (1.21+)|
 //! | V4      | 1.26        | +epclntab                                          |
 //! | V5      | 1.27+       | -typelinks, -itablinks, +typedesclen, +itaboffset  |
 //!
-//! Source: `src/runtime/symtab.go:402-450`
+//! Source: `src/runtime/symtab.go` (field offsets verified per release tag).
 
 use crate::structures::{
     PclntabVersion,
@@ -243,6 +244,13 @@ pub struct Moduledata {
 /// Go 1.26, not 1.24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuledataVersion {
+    /// Go 1.5-1.15 (legacy "Go 1.2" pclntab): no `pcHeader`/`funcnametab`/
+    /// `cutab`/`pctab`; `pclntable` is the whole pclntab and `filetab` is a
+    /// `[]uint32`. Field-introduction versions: `itablinks` (1.6);
+    /// `types`/`etypes`, `typelinks []int32`, `typemap` (1.7);
+    /// `textsectmap`/`ptab`/`pluginpath`/`pkghashes` (1.8); `hasmain`/`bad`
+    /// (1.10).
+    V1,
     /// Go 1.16-1.17: no `rodata`/`gofunc`, no `covctrs`, no `inittasks`.
     V2,
     /// Go 1.18-1.25: `+rodata`/`gofunc`; `+covctrs` (1.20+); `+inittasks`
@@ -298,6 +306,22 @@ impl Moduledata {
         let maxpc = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
 
+        // The Go 1.5-1.15 moduledata has an entirely different head (no
+        // `pcHeader` pointer; `pclntable []byte` first) and is parsed
+        // separately.
+        // The middle/tail layout is determined per-field from the pclntab
+        // magic and the Go minor version, verified against runtime/symtab.go
+        // across releases:
+        //   - rodata / gofunc           : Go 1.18+ (magic Go118 or Go120)
+        //   - covctrs                   : Go 1.20+ (magic Go120)
+        //   - inittasks                 : Go 1.21+
+        //   - epclntab                  : Go 1.26+ (absent in 1.24 / 1.25!)
+        //   - V5 (typedesclen + itaboffset/itabsize, no typelinks/itablinks):
+        //                                 Go 1.27+
+        if pclntab_version == PclntabVersion::Go12 {
+            return Self::parse_go12_legacy(data, ps, go_version_minor);
+        }
+
         let text = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
         let etext = read_uintptr(data, off, ps)?;
@@ -316,18 +340,6 @@ impl Moduledata {
         let bss = read_range(&mut off)?;
         let noptrbss = read_range(&mut off)?;
 
-        // The middle/tail layout is determined per-field from the pclntab
-        // magic and the Go minor version, verified against runtime/symtab.go
-        // across releases:
-        //   - rodata / gofunc           : Go 1.18+ (magic Go118 or Go120)
-        //   - covctrs                   : Go 1.20+ (magic Go120)
-        //   - inittasks                 : Go 1.21+
-        //   - epclntab                  : Go 1.26+ (absent in 1.24 / 1.25!)
-        //   - V5 (typedesclen + itaboffset/itabsize, no typelinks/itablinks):
-        //                                 Go 1.27+
-        if pclntab_version == PclntabVersion::Go12 {
-            return None;
-        }
         // `covctrs` sits *before* `types`, so its presence shifts every later
         // field; `rodata`/`gofunc` sit *after* `etypes`. They were added in
         // different releases (1.20 vs 1.18), so they must be gated separately.
@@ -543,6 +555,240 @@ impl Moduledata {
             version,
         })
     }
+
+    /// Parse the legacy (Go 1.5-1.15) `moduledata`.
+    ///
+    /// This layout predates the `pcHeader` indirection: it begins with the
+    /// `pclntable []byte` slice (pointing at the whole pclntab) rather than a
+    /// `pcHeader` pointer, has no `funcnametab`/`cutab`/`pctab`, and stores a
+    /// `[]uint32` `filetab`. The tail grew across releases, so fields are gated
+    /// on the detected Go minor version (defaulting to the most complete
+    /// 1.9-1.15 shape when the version is unknown):
+    ///
+    /// - `types`/`etypes` and `typelinks []int32`: Go 1.7+ (pre-1.7 used
+    ///   `typelinks []*_type` and had no `types` base; handled by skipping the
+    ///   type fields).
+    /// - `textsectmap`, `ptab`, `pluginpath`, `pkghashes`, `hasmain`,
+    ///   `typemap`: Go 1.8+ (`typemap` from 1.7).
+    /// - `bad`: Go 1.9+.
+    ///
+    /// Modern-only fields (`pcHeader`, `funcnametab`, `cutab`, `pctab`,
+    /// `covctrs`, `rodata`, `gofunc`, `inittasks`, `epclntab`, V5 itab fields)
+    /// are left empty/`None`.
+    ///
+    /// Source: `src/runtime/symtab.go` `moduledata` (Go 1.5-1.15).
+    fn parse_go12_legacy(data: &[u8], ps: u8, go_version_minor: Option<u32>) -> Option<Self> {
+        // `moduledata` was introduced in Go 1.5. Go 1.2-1.4 have none, so when
+        // the version is known to predate 1.5 we refuse to parse — otherwise a
+        // pclntab-address pointer elsewhere in the image could be mistaken for
+        // a (false) moduledata. When the version is unknown we still attempt it
+        // and rely on the locator's structural validation.
+        if go_version_minor.is_some_and(|m| m < 5) {
+            return None;
+        }
+
+        let p = ps as usize;
+        let slice_sz = GoSlice::size(ps);
+        let string_sz = p.checked_mul(2)?;
+        let bv_sz = Bitvector::size(ps);
+
+        // Feature gates keyed on the Go minor version, verified field-by-field
+        // against runtime/symtab.go per release tag:
+        //   itablinks                                : Go 1.6
+        //   types/etypes, typelinks []int32, typemap : Go 1.7
+        //   textsectmap, ptab, pluginpath, pkghashes : Go 1.8 (plugin support)
+        //   hasmain, bad                             : Go 1.10
+        // Go 1.5 is the leanest (`typelinks []*_type` pointers, no types/etypes,
+        // no itablinks, no typemap); Go 1.9 has the plugin fields but not
+        // hasmain/bad. An unknown minor assumes the richest 1.10-1.15 shape and
+        // degrades gracefully via the best-effort tail reads below.
+        let has_itablinks = go_version_minor.is_none_or(|m| m >= 6);
+        let has_types = go_version_minor.is_none_or(|m| m >= 7);
+        let has_typemap = go_version_minor.is_none_or(|m| m >= 7);
+        let has_textsectmap = go_version_minor.is_none_or(|m| m >= 8);
+        let has_plugin_fields = go_version_minor.is_none_or(|m| m >= 8);
+        let has_hasmain = go_version_minor.is_none_or(|m| m >= 10);
+        let has_bad = go_version_minor.is_none_or(|m| m >= 10);
+
+        let mut off = 0usize;
+
+        // Head: pclntable, ftab, filetab slices; findfunctab, minpc, maxpc.
+        let pclntable = GoSlice::parse(data, off, ps)?;
+        off = advance(off, slice_sz)?;
+        let ftab = GoSlice::parse(data, off, ps)?;
+        off = advance(off, slice_sz)?;
+        let filetab = GoSlice::parse(data, off, ps)?;
+        off = advance(off, slice_sz)?;
+        let findfunctab = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+        let minpc = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+        let maxpc = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+
+        let text = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+        let etext = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+
+        let read_range = |off: &mut usize| -> Option<VaRange> {
+            let start = read_uintptr(data, *off, ps)?;
+            *off = advance(*off, p)?;
+            let end = read_uintptr(data, *off, ps)?;
+            *off = advance(*off, p)?;
+            Some(VaRange { start, end })
+        };
+        let noptrdata = read_range(&mut off)?;
+        let data_seg = read_range(&mut off)?;
+        let bss = read_range(&mut off)?;
+        let noptrbss = read_range(&mut off)?;
+
+        let end = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+        let gcdata = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+        let gcbss = read_uintptr(data, off, ps)?;
+        off = advance(off, p)?;
+
+        // types/etypes (Go 1.7+).
+        let (types, etypes) = if has_types {
+            let t = read_uintptr(data, off, ps)?;
+            off = advance(off, p)?;
+            let e = read_uintptr(data, off, ps)?;
+            off = advance(off, p)?;
+            (t, e)
+        } else {
+            (0, 0)
+        };
+
+        // textsectmap (Go 1.8+).
+        let textsectmap = if has_textsectmap {
+            let ts = GoSlice::parse(data, off, ps).unwrap_or_default();
+            off = advance(off, slice_sz)?;
+            ts
+        } else {
+            GoSlice::default()
+        };
+
+        // typelinks (present from Go 1.5; `[]*_type` pointers pre-1.7, `[]int32`
+        // offsets from Go 1.7) followed by itablinks (`[]*itab`, Go 1.6+).
+        let typelinks = GoSlice::parse(data, off, ps)?;
+        off = advance(off, slice_sz)?;
+        let itablinks = if has_itablinks {
+            let il = GoSlice::parse(data, off, ps)?;
+            off = advance(off, slice_sz)?;
+            Some(il)
+        } else {
+            None
+        };
+
+        // ptab, pluginpath, pkghashes (Go 1.8+).
+        let (ptab, pluginpath, pkghashes) = if has_plugin_fields {
+            let pt = GoSlice::parse(data, off, ps).unwrap_or_default();
+            off = advance(off, slice_sz)?;
+            let pp = GoStr::parse(data, off, ps).unwrap_or_default();
+            off = advance(off, string_sz)?;
+            let pk = GoSlice::parse(data, off, ps).unwrap_or_default();
+            off = advance(off, slice_sz)?;
+            (pt, pp, pk)
+        } else {
+            (GoSlice::default(), GoStr::default(), GoSlice::default())
+        };
+
+        // Tail (best-effort — a truncated moduledata must not fail the parse):
+        // modulename, modulehashes, [hasmain], gcdatamask, gcbssmask,
+        // [typemap], [bad], next.
+        let modulename = GoStr::parse(data, off, ps).unwrap_or_default();
+        off = off.saturating_add(string_sz);
+        let modulehashes = GoSlice::parse(data, off, ps).unwrap_or_default();
+        off = off.saturating_add(slice_sz);
+
+        let has_main = if has_hasmain {
+            let hm = data.get(off).is_some_and(|&b| b != 0);
+            off = off.saturating_add(1);
+            hm
+        } else {
+            // Pre-1.8 had no `hasmain`; a statically-linked executable is the
+            // main module by definition.
+            true
+        };
+
+        // Bitvectors sit on a pointer boundary.
+        let mut o = align_up(off, p).unwrap_or(off);
+        let gcdatamask = Bitvector::parse(data, o, ps).unwrap_or_default();
+        o = o.saturating_add(bv_sz);
+        let gcbssmask = Bitvector::parse(data, o, ps).unwrap_or_default();
+        o = o.saturating_add(bv_sz);
+
+        let typemap = if has_typemap {
+            let tm = read_uintptr(data, o, ps).unwrap_or(0);
+            o = o.saturating_add(p);
+            tm
+        } else {
+            0
+        };
+
+        // `bad` (Go 1.9+) sits between `typemap` and `next`.
+        let bad = if has_bad {
+            let b = data.get(o).is_some_and(|&v| v != 0);
+            o = align_up(o.saturating_add(1), p).unwrap_or(o);
+            b
+        } else {
+            false
+        };
+        let next = read_uintptr(data, o, ps).unwrap_or(0);
+
+        Some(Moduledata {
+            // Legacy has no pcHeader; record the pclntab address it points at.
+            pc_header: pclntable.ptr,
+            funcnametab: GoSlice::default(),
+            cutab: GoSlice::default(),
+            filetab,
+            pctab: GoSlice::default(),
+            pclntable,
+            ftab,
+            findfunctab,
+            minpc,
+            maxpc,
+            text,
+            etext,
+            noptrdata,
+            data: data_seg,
+            bss,
+            noptrbss,
+            end,
+            gcdata,
+            gcbss,
+            covctrs: None,
+            types,
+            typedesclen: None,
+            etypes,
+            rodata: None,
+            gofunc: None,
+            epclntab: None,
+            // Pre-1.7 `typelinks` are `[]*_type` pointers, not the `[]int32`
+            // offsets-from-`types` the extractor expects, so they are not
+            // surfaced (type extraction needs the Go 1.7+ typeOff scheme).
+            typelinks: if has_types { Some(typelinks) } else { None },
+            itablinks,
+            itaboffset: None,
+            itabsize: None,
+            inittasks: None,
+            textsectmap,
+            ptab,
+            pluginpath,
+            pkghashes,
+            modulename,
+            modulehashes,
+            has_main,
+            bad,
+            gcdatamask,
+            gcbssmask,
+            typemap,
+            next,
+            version: ModuledataVersion::V1,
+        })
+    }
 }
 
 /// Heuristic: do the three pointer-sized words at `off` look like a Go slice
@@ -661,9 +907,39 @@ mod tests {
     }
 
     #[test]
-    fn go12_unsupported() {
-        let data = vec![0u8; 500];
-        assert!(Moduledata::parse(&data, 8, PclntabVersion::Go12, false, None).is_none());
+    fn go12_legacy_parses_v1() {
+        // Minimal legacy (Go 1.5-1.15) moduledata head: pclntable slice, then
+        // ftab/filetab/findfunctab/minpc/maxpc, text/etext, four data ranges,
+        // end/gcdata/gcbss, types/etypes. The tail is read best-effort.
+        let mut data = vec![0u8; 512];
+        let put = |d: &mut [u8], off: usize, v: u64| {
+            d[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        // pclntable slice @0 (ptr, len, cap).
+        put(&mut data, 0, 0x5000);
+        put(&mut data, 8, 0x100);
+        put(&mut data, 16, 0x100);
+        put(&mut data, 80, 0x1000); // minpc
+        put(&mut data, 88, 0x2000); // maxpc
+        put(&mut data, 96, 0x1000); // text
+        put(&mut data, 104, 0x2000); // etext
+        put(&mut data, 200, 0x9000); // types
+        put(&mut data, 208, 0xa000); // etypes
+
+        let md = Moduledata::parse(&data, 8, PclntabVersion::Go12, false, Some(10))
+            .expect("legacy moduledata should parse");
+        assert_eq!(md.version, ModuledataVersion::V1);
+        assert_eq!(md.pclntable.ptr, 0x5000);
+        assert_eq!(md.minpc, 0x1000);
+        assert_eq!(md.maxpc, 0x2000);
+        assert_eq!(md.text, 0x1000);
+        assert_eq!(md.etext, 0x2000);
+        assert_eq!(md.types, 0x9000);
+        assert_eq!(md.etypes, 0xa000);
+        // Modern-only fields are absent in the legacy layout.
+        assert!(md.rodata.is_none());
+        assert!(md.gofunc.is_none());
+        assert_eq!(md.funcnametab.ptr, 0);
     }
 
     #[test]
