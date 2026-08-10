@@ -1164,12 +1164,8 @@ fn build_go_type<'a>(
             // the bare `FuncTypeExtra::SIZE` here would land the `UncommonType`
             // parse short by the padding, yielding a garbage `mcount`/`moff`.
             // Mirror `descriptor::descriptor_size`'s accounting.
-            TypeKind::Func => {
-                match align_up(base_sz.saturating_add(FuncTypeExtra::SIZE), ps as usize) {
-                    Some(off) => off.saturating_sub(base_sz),
-                    None => return None,
-                }
-            }
+            TypeKind::Func => align_up(base_sz.saturating_add(FuncTypeExtra::SIZE), ps as usize)?
+                .saturating_sub(base_sz),
             TypeKind::Interface => InterfaceTypeExtra::size(ps),
             TypeKind::Map => MapTypeExtra::size(ps),
             TypeKind::Pointer | TypeKind::Slice => ElemTypeExtra::size(ps),
