@@ -5,6 +5,22 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+### Fixed
+
+- Replaced a `match` that current clippy flags as expressible with `?` in
+  `structures::types`. Behaviour is unchanged; the lint did not exist when CI
+  last ran, and the workflow pins `@stable`, so it now fails the `-D warnings`
+  gate on every build.
+
+### Changed
+
+- Recorded ATRAPS LLC as copyright holder and added a `NOTICE` file. No functional change.
+- Dropped the deprecated `authors` field and repointed `repository` at the organisation.
+- Refreshed transitive dependencies (`cargo update`); no direct dependency changed version.
+- Publishing now uses crates.io trusted publishing instead of a stored registry token.
+
 ## [0.4.0]
 
 ### Added
@@ -579,9 +595,10 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
-[0.4.0]: https://github.com/BinFlip/gobin/compare/v0.3.1...v0.4.0
-[0.3.1]: https://github.com/BinFlip/gobin/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/BinFlip/gobin/compare/v0.2.1...v0.3.0
-[0.2.1]: https://github.com/BinFlip/gobin/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/BinFlip/gobin/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/BinFlip/gobin/releases/tag/v0.1.0
+[0.4.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ATRAPSLLC/gobin/releases/tag/v0.1.0
