@@ -2,11 +2,10 @@
 name = "gobin"
 version = "0.4.0"
 edition = "2024"
-authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
 description = "Static analysis library for Go compiled binaries - identification and metadata extraction"
 license = "Apache-2.0"
-repository = "https://github.com/BinFlip/gobin"
+repository = "https://github.com/ATRAPSLLC/gobin"
 readme = "README.md"
 keywords = ["golang", "go", "parser", "reverse-engineering", "binary-analysis"]
 categories = ["parser-implementations"]
