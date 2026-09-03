@@ -9,9 +9,15 @@
 //! 1. **Typelink path** (ELF `.typelink`, Mach-O `__typelink`): An array of `int32`
 //!    offsets from `moduledata.types`. Each offset points to an `abi.Type`.
 //!
-//! 2. **Descriptor-walking path** (PE, or future Go without typelinks): Walk from
-//!    `moduledata.types + PtrSize` to `moduledata.etypes`, advancing by each type's
-//!    `DescriptorSize`. Same algorithm as the Go runtime's `moduleTypelinks()`.
+//! 2. **Descriptor-walking path** (Go 1.27+, which has no typelink table): Walk
+//!    from `moduledata.types + PtrSize` to `moduledata.types + typedesclen`,
+//!    advancing by each type's `DescriptorSize` with pointer alignment — the
+//!    same algorithm as the Go runtime's `moduleTypelinks()`. Nothing past
+//!    `typedesclen` is walkable: the linker groups every `type:`-prefixed
+//!    read-only symbol under one carrier and sorts the non-typelink remainder
+//!    by size, so that region interleaves descriptors with
+//!    `type:.namedata.*` blobs and ends in the inline itab array. Those
+//!    descriptors are reachable only through [`extract_all_types`].
 //!
 //! 3. **PE moduledata discovery**: PE binaries lack Go-specific section names.
 //!    We find moduledata by scanning `.data` for a pointer matching the pclntab VA
@@ -20,16 +26,17 @@
 //! ## Source References
 //!
 //! - Type descriptors: `src/internal/abi/type.go`
-//! - Type walking: `src/runtime/type.go:522-545` (`moduleTypelinks`)
-//! - Moduledata: `src/runtime/symtab.go:402-450`
+//! - Type walking: `src/runtime/type.go` (`moduleTypelinks`)
+//! - Type-section layout: `src/cmd/link/internal/ld/data.go` (`dodataSect`,
+//!   `sym.STYPE` case) — which also records `typedesclen` and `itaboffset`
+//! - Moduledata: `src/runtime/symtab.go`
 
 use std::collections::{HashSet, VecDeque};
 
 use crate::{
-    formats::{BinaryContext, BinaryFormat},
+    formats::BinaryContext,
     metadata::{is_internal_path, is_runtime_path, is_stdlib_path},
     structures::{
-        PclntabVersion,
         abitype::AbiType,
         arraytype::ArrayTypeExtra,
         chantype::ChanTypeExtra,
@@ -37,10 +44,9 @@ use crate::{
         elemtype::ElemTypeExtra,
         functype::FuncTypeExtra,
         interfacetype::InterfaceTypeExtra,
-        maptype::MapTypeExtra,
         method::GoImethod,
         method::GoMethod,
-        moduledata::{Moduledata, ModuledataVersion},
+        moduledata::Moduledata,
         name::{
             NAME_FLAG_EMBEDDED, NAME_FLAG_EXPORTED, decode_name, decode_name_and_tag,
             decode_name_with_flags,
@@ -50,6 +56,26 @@ use crate::{
         util::{align_up, align_up_u64, read_uintptr},
     },
 };
+
+/// Re-exported so callers reading [`TypeDetail::Map`] do not have to reach
+/// into `structures::maptype` for the layout tag and raw descriptor fields.
+pub use crate::structures::maptype::{MapFlags, MapLayout, MapTypeExtra};
+
+/// The per-binary constants every type-descriptor read depends on.
+///
+/// All three are fixed for a whole binary but vary between binaries, and all
+/// three change how the *same* bytes decode, so they travel together rather
+/// than as a row of positional parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct TypeAbi {
+    /// Pointer size in bytes (4 or 8).
+    pub ps: u8,
+    /// Go ≤ 1.16 encodes type-name lengths as a 2-byte big-endian `uint16`;
+    /// 1.17+ uses a varint. See [`crate::structures::name::decode_name`].
+    pub legacy_names: bool,
+    /// Which `abi.MapType` shape this binary's map descriptors use.
+    pub map_layout: MapLayout,
+}
 
 /// A type extracted deterministically from Go type descriptors.
 ///
@@ -254,17 +280,20 @@ pub enum TypeDetail<'a> {
         key_va: u64,
         /// Virtual address of the element (value) type descriptor.
         elem_va: u64,
-        /// Virtual address of the internal bucket/group type descriptor.
+        /// Virtual address of the internal bucket (Go ≤ 1.23) or slot-group
+        /// (Go 1.24+) type descriptor.
         group_va: u64,
-        /// Virtual address of the key-hashing function.
-        hasher_va: u64,
-        /// Byte stride between keys in a bucket/group.
-        key_stride: u64,
-        /// Byte stride between elements in a bucket/group.
-        elem_stride: u64,
-        /// Map implementation flags (`abi.MapType.Flags` /
-        /// `maptype.flags` — indirect-key/elem, reflexive-key, etc.).
-        flags: u32,
+        /// Every remaining descriptor field, tagged with the [`MapLayout`] it
+        /// was read under: the hasher, the per-version size/stride fields, and
+        /// the normalized [`MapFlags`]. `abi.MapType` has had six shapes, so
+        /// only the three addresses above are common to all of them; reach for
+        /// [`MapTypeExtra::key_stride`] / [`MapTypeExtra::elem_stride`] for
+        /// layout-independent strides.
+        ///
+        /// Boxed because the full descriptor is far larger than any other
+        /// variant's payload, and map types are a small minority of any
+        /// binary's type set.
+        extra: Box<MapTypeExtra>,
     },
     /// Pointer type: `*T`.
     Pointer {
@@ -549,29 +578,43 @@ pub struct TypeIter<'a> {
     ctx: &'a BinaryContext<'a>,
     data: &'a [u8],
     types_base_va: u64,
-    ps: u8,
-    /// Pre-1.17 (`Go116`) name length encoding (2-byte big-endian vs varint).
-    legacy: bool,
+    abi: TypeAbi,
     strategy: TypeIterStrategy<'a>,
 }
 
 enum TypeIterStrategy<'a> {
     /// Iterate `int32` offsets from a typelink array.
     Typelinks { tl_data: &'a [u8], pos: usize },
-    /// Walk `[types_base_va + ps .. etypes_va]` advancing by `DescriptorSize`.
-    Walk { td: u64, etypes_va: u64 },
+    /// Walk a contiguous descriptor region `[td, end_va)`, advancing by
+    /// `DescriptorSize` with pointer alignment — the same stepper
+    /// `runtime.moduleTypelinks` uses on Go 1.27+.
+    Walk {
+        /// VA of the next descriptor to parse.
+        td: u64,
+        /// One past the last byte of the region.
+        end_va: u64,
+        /// Remaining tolerance for unparseable records before the walk gives
+        /// up. Without a budget one bad byte would either truncate the whole
+        /// enumeration or spin over a large region one word at a time.
+        skips_left: u32,
+    },
     /// No types reachable.
     Empty,
 }
 
 impl<'a> TypeIter<'a> {
-    fn empty(ctx: &'a BinaryContext<'a>) -> Self {
+    /// An iterator that yields nothing — the result when a binary has no
+    /// moduledata, no VA mapping, or no types region.
+    pub fn empty(ctx: &'a BinaryContext<'a>) -> Self {
         Self {
             ctx,
             data: ctx.structure_search_data(),
             types_base_va: 0,
-            ps: 0,
-            legacy: false,
+            abi: TypeAbi {
+                ps: 0,
+                legacy_names: false,
+                map_layout: MapLayout::SwissSplitGroup,
+            },
             strategy: TypeIterStrategy::Empty,
         }
     }
@@ -599,8 +642,7 @@ impl<'a> Iterator for TypeIter<'a> {
                             file_off,
                             type_va,
                             self.types_base_va,
-                            self.ps,
-                            self.legacy,
+                            self.abi,
                             self.ctx,
                         )
                     {
@@ -610,38 +652,64 @@ impl<'a> Iterator for TypeIter<'a> {
                 }
                 None
             }
-            TypeIterStrategy::Walk { td, etypes_va } => {
-                let p = self.ps as u64;
+            TypeIterStrategy::Walk {
+                td,
+                end_va,
+                skips_left,
+            } => {
+                let p = self.abi.ps as u64;
                 if p == 0 {
                     return None;
                 }
-                while *td < *etypes_va {
+                while *td < *end_va {
                     *td = align_up_u64(*td, p)?;
-                    if *td >= *etypes_va {
+                    if *td >= *end_va {
                         return None;
                     }
-                    let file_off = self.ctx.va_to_file(*td)?;
+                    let here = *td;
+                    // Step over an unparseable record rather than ending the
+                    // walk. On Go 1.27+ this is the only type-enumeration
+                    // strategy there is, so aborting on the first bad byte
+                    // would silently truncate a whole binary's type list.
+                    let mut skip = || -> Option<()> {
+                        *skips_left = skips_left.checked_sub(1)?;
+                        *td = here.checked_add(p)?;
+                        Some(())
+                    };
+                    let Some(file_off) = self.ctx.va_to_file(here) else {
+                        skip()?;
+                        continue;
+                    };
                     let remaining = match self.data.get(file_off..) {
-                        Some(d) if d.len() >= AbiType::size(self.ps) => d,
+                        Some(d) if d.len() >= AbiType::size(self.abi.ps) => d,
+                        // Past the end of the mapped image: nothing follows.
                         _ => return None,
                     };
-                    let abi_type = AbiType::parse(remaining, self.ps)?;
-                    let desc_size = match descriptor::descriptor_size(remaining, &abi_type, self.ps)
-                    {
+                    let (Some(abi_type), _) = (AbiType::parse(remaining, self.abi.ps), ()) else {
+                        skip()?;
+                        continue;
+                    };
+                    let desc_size = match descriptor::descriptor_size(
+                        remaining,
+                        &abi_type,
+                        self.abi.ps,
+                        self.abi.map_layout,
+                    ) {
                         Some(s) if s > 0 => s,
-                        _ => return None,
+                        _ => {
+                            skip()?;
+                            continue;
+                        }
                     };
                     let go_type = build_go_type(
                         &abi_type,
                         remaining,
                         self.data,
                         self.types_base_va,
-                        self.ps,
-                        self.legacy,
+                        self.abi,
                         self.ctx,
                     );
-                    let here = *td;
-                    *td = td.checked_add(desc_size as u64)?;
+                    *td = here.checked_add(desc_size as u64)?;
                     if let Some(mut t) = go_type {
                         t.descriptor_va = here;
                         return Some(t);
@@ -654,67 +722,52 @@ impl<'a> Iterator for TypeIter<'a> {
     }
 }
 
-/// Construct a streaming type iterator. The constructor performs moduledata
-/// discovery up front (cheap on ELF / Mach-O, scan-based on PE) so each
-/// [`Iterator::next`] call does only the per-type work.
+/// Construct a streaming iterator over the binary's **reflection-visible**
+/// type descriptors — the set the `typelink` table used to name.
+///
+/// The constructor performs moduledata discovery up front (cheap on ELF /
+/// Mach-O, scan-based on PE) so each [`Iterator::next`] call does only the
+/// per-type work.
 ///
 /// Strategy selection:
-/// 1. Dedicated `.typelink` / `__typelink` section if present.
-/// 2. `moduledata.typelinks` slice (PE / older Go).
-/// 3. Descriptor walk over `[types .. etypes]`.
+/// 1. Dedicated `.typelink` / `__typelink` section if present (Go ≤ 1.26).
+/// 2. `moduledata.typelinks` slice (PE / wasm / RELRO ELF, Go ≤ 1.26).
+/// 3. Descriptor walk. Go 1.27 removed both tables and instead sorts the
+///    typelink descriptors to the front of the types region, recording their
+///    total length in `moduledata.typedesclen`; walking
+///    `[types + ptrSize, types + typedesclen)` reproduces the old table
+///    exactly, and is what `runtime.moduleTypelinks` itself does. Pre-1.27
+///    binaries that reach this branch have no such bound and fall back to
+///    `etypes`.
 /// 4. Empty iterator if none of the above is available.
+///
+/// The descriptors Go 1.27 keeps *after* `typedesclen` are not separately
+/// enumerable: the linker groups every `type:`-prefixed read-only symbol under
+/// one carrier and sorts the non-typelink remainder by size, so that region
+/// interleaves descriptors with `type:.namedata.*` blobs and no boundary
+/// between them is recorded. Those types are reached through
+/// [`extract_all_types`] instead.
 pub fn extract_types_iter<'a>(
     ctx: &'a BinaryContext<'a>,
-    ptr_size: u8,
-    pclntab_version: Option<PclntabVersion>,
-    pclntab_offset: Option<usize>,
-    go_version_minor: Option<u32>,
+    md: &Moduledata,
+    abi: TypeAbi,
 ) -> TypeIter<'a> {
-    if !ctx.has_va_mapping() {
+    if !ctx.has_va_mapping() || abi.ps == 0 || md.types == 0 {
         return TypeIter::empty(ctx);
     }
-
-    // Read all runtime structures through the address-space view: file
-    // bytes for ELF/Mach-O/PE, the reconstructed linear-memory image for
-    // wasm. Wasm pclntab/moduledata/types live in linear memory and span
-    // multiple disjoint data segments, so accessing them via file offsets
-    // alone would split structures at segment boundaries.
+    // Read runtime structures through the address-space view: file bytes for
+    // ELF/Mach-O/PE, the reconstructed linear-memory image for wasm. Wasm type
+    // descriptors span multiple disjoint data segments, so addressing them by
+    // file offset alone would split structures at segment boundaries.
     let data = ctx.structure_search_data();
     let sections = ctx.sections();
-    let pv = pclntab_version.unwrap_or(PclntabVersion::Go120);
-    let has_typelink = sections.typelink.is_some();
-    // Go ≤1.16 encodes type-name lengths as a 2-byte big-endian uint16; 1.17+
-    // uses a varint. See `name::decode_name`.
-    let legacy = matches!(pv, PclntabVersion::Go116 | PclntabVersion::Go12);
 
-    // Find moduledata: the dedicated `.go.module` section (Go 1.26+), else a
-    // pointer-scan for its pcHeader pointer. The section is absent on PE, on
-    // wasm, and on ELF / Mach-O before Go 1.26, so the scan is the fallback for
-    // every non-section case.
-    let moduledata = if let Some(ref range) = sections.go_module {
-        let end = match range.offset.checked_add(range.size) {
-            Some(e) => e,
-            None => return TypeIter::empty(ctx),
-        };
-        let md_data = match data.get(range.offset..end) {
-            Some(s) => s,
-            None => return TypeIter::empty(ctx),
-        };
-        Moduledata::parse(md_data, ptr_size, pv, has_typelink, go_version_minor)
-    } else {
-        discover_moduledata_via_pcheader(
-            ctx,
-            ptr_size,
-            pv,
-            has_typelink,
-            go_version_minor,
-            pclntab_offset,
-        )
-    };
-
-    let md = match moduledata {
-        Some(m) if m.types != 0 => m,
-        _ => return TypeIter::empty(ctx),
+    let iter = |strategy| TypeIter {
+        ctx,
+        data,
+        types_base_va: md.types,
+        abi,
+        strategy,
     };
 
     // Strategy 1: dedicated typelink section.
@@ -722,14 +775,7 @@ pub fn extract_types_iter<'a>(
         && let Some(end) = range.offset.checked_add(range.size)
         && let Some(tl_data) = data.get(range.offset..end)
     {
-        return TypeIter {
-            ctx,
-            data,
-            types_base_va: md.types,
-            ps: ptr_size,
-            legacy,
-            strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
-        };
+        return iter(TypeIterStrategy::Typelinks { tl_data, pos: 0 });
     }
 
     // Strategy 1b: typelinks slice from moduledata (Go 1.16-1.26 PE).
@@ -739,108 +785,55 @@ pub fn extract_types_iter<'a>(
         && let Some(tl_end) = tl_file_off.checked_add(tl_byte_len)
         && let Some(tl_data) = data.get(tl_file_off..tl_end)
     {
-        return TypeIter {
-            ctx,
-            data,
-            types_base_va: md.types,
-            ps: ptr_size,
-            legacy,
-            strategy: TypeIterStrategy::Typelinks { tl_data, pos: 0 },
-        };
+        return iter(TypeIterStrategy::Typelinks { tl_data, pos: 0 });
     }
 
     // Strategy 2: walk the type descriptor region.
-    if md.etypes > md.types {
-        let td = md.types.saturating_add(ptr_size as u64); // skip ptrSize header
-        return TypeIter {
-            ctx,
-            data,
-            types_base_va: md.types,
-            ps: ptr_size,
-            legacy,
-            strategy: TypeIterStrategy::Walk {
-                td,
-                etypes_va: md.etypes,
-            },
-        };
+    match typelink_walk_range(md, abi.ps) {
+        Some((td, end_va)) => iter(TypeIterStrategy::Walk {
+            td,
+            end_va,
+            skips_left: WALK_SKIP_BUDGET,
+        }),
+        None => TypeIter::empty(ctx),
     }
-
-    TypeIter::empty(ctx)
 }
 
-/// Find moduledata by scanning the address-space view for a pointer-aligned
-/// value equal to the pclntab's VA.
+/// How many unparseable records a descriptor walk tolerates before giving up.
+/// Generous enough to step over inter-region padding and the odd descriptor
+/// kind we do not model, small enough that a walk over non-type bytes stops
+/// quickly instead of grinding through a whole segment one word at a time.
+const WALK_SKIP_BUDGET: u32 = 64;
+
+/// `[start, end)` VAs of the typelink (reflection-visible) descriptor region.
 ///
-/// The first field of moduledata is `pcHeader *pcHeader`, which points to the
-/// pclntab. For PE we scan `data` (file bytes) for that pointer at pointer-
-/// aligned positions; for wasm we scan the reconstructed linear-memory image
-/// the same way (offsets in the image are linear-memory addresses, exactly
-/// what the runtime stores).
-fn discover_moduledata_via_pcheader(
-    ctx: &BinaryContext<'_>,
-    ps: u8,
-    pv: PclntabVersion,
-    has_typelink: bool,
-    go_version_minor: Option<u32>,
-    pclntab_offset: Option<usize>,
-) -> Option<Moduledata> {
-    let data = ctx.structure_search_data();
-    let pclntab_off = pclntab_offset?;
-    let pclntab_va = if ctx.format() == BinaryFormat::Wasm {
-        pclntab_off as u64
+/// On V5 the region is bounded by `moduledata.typedesclen`, exactly as
+/// `runtime.moduleTypelinks` reads it; the descriptors past that bound are
+/// non-typelink types and then itabs, neither of which belongs in the
+/// typelink enumeration. Pre-V5 binaries have no such bound — they only reach
+/// this walk when both typelink tables are unavailable — so the whole types
+/// region is used.
+///
+/// The `ptrSize` skip at the head is the slot the linker reserves so that no
+/// type reference has offset zero; `type:*` sits there.
+///
+/// Nothing past `typedesclen` can be walked the same way. The linker groups
+/// *every* `type:`-prefixed read-only symbol under the same carrier and sorts
+/// the non-typelink remainder by size, so `[typedesclen, itaboffset)` is a mix
+/// of non-typelink descriptors and `type:.namedata.*` blobs with no recorded
+/// boundary between them. Those descriptors are reachable only by following
+/// references — see [`extract_all_types`].
+fn typelink_walk_range(md: &Moduledata, ptr_size: u8) -> Option<(u64, u64)> {
+    let start = md.types.checked_add(u64::from(ptr_size))?;
+    let end = match md.typedesclen {
+        Some(len) => md.types.checked_add(len)?,
+        None => md.etypes,
+    };
+    if end > start {
+        Some((start, end))
     } else {
-        ctx.file_to_va(pclntab_off)?
-    };
-
-    let p = ps as usize;
-
-    if p == 0 {
-        return None;
+        None
     }
-    let search_start = data.len().checked_div(4).unwrap_or(0); // skip code region
-    let target_bytes = match ps {
-        4 => (pclntab_va as u32).to_le_bytes().to_vec(),
-        8 => pclntab_va.to_le_bytes().to_vec(),
-        _ => return None,
-    };
-
-    let mut offset = search_start;
-    while let Some(end) = offset.checked_add(p) {
-        if end > data.len() {
-            break;
-        }
-
-        let rem = offset.checked_rem(p).unwrap_or(0);
-        if rem != 0 {
-            let bump = p.saturating_sub(rem);
-            offset = match offset.checked_add(bump) {
-                Some(o) => o,
-                None => break,
-            };
-            continue;
-        }
-
-        if data.get(offset..end) == Some(target_bytes.as_slice()) {
-            let remaining = match data.get(offset..) {
-                Some(r) => r,
-                None => break,
-            };
-            if let Some(md) = Moduledata::parse(remaining, ps, pv, has_typelink, go_version_minor) {
-                let anchored = match md.version {
-                    ModuledataVersion::V1 => md.text != 0 && ctx.va_to_file(md.text).is_some(),
-                    _ => md.types != 0 && ctx.va_to_file(md.funcnametab.ptr).is_some(),
-                };
-                if md.minpc < md.maxpc && anchored {
-                    return Some(md);
-                }
-            }
-        }
-        offset = match offset.checked_add(p) {
-            Some(o) => o,
-            None => break,
-        };
-    }
-    None
 }
 
 /// Parse a single `abi.Type` at the given file offset and build a `GoType`.
@@ -849,13 +842,12 @@ fn parse_type_at<'a>(
     file_off: usize,
     type_va: u64,
     types_base_va: u64,
-    ps: u8,
-    legacy: bool,
+    abi: TypeAbi,
     ctx: &BinaryContext<'a>,
 ) -> Option<GoType<'a>> {
     let remaining = data.get(file_off..)?;
-    let abi_type = AbiType::parse(remaining, ps)?;
-    let mut t = build_go_type(&abi_type, remaining, data, types_base_va, ps, legacy, ctx)?;
+    let abi_type = AbiType::parse(remaining, abi.ps)?;
+    let mut t = build_go_type(&abi_type, remaining, data, types_base_va, abi, ctx)?;
     t.descriptor_va = type_va;
     Some(t)
 }
@@ -865,12 +857,11 @@ pub fn type_at_va<'a>(
     ctx: &'a BinaryContext<'a>,
     va: u64,
     types_base_va: u64,
-    ps: u8,
-    legacy: bool,
+    abi: TypeAbi,
 ) -> Option<GoType<'a>> {
     let data = ctx.structure_search_data();
     let file_off = ctx.va_to_file(va)?;
-    let t = parse_type_at(data, file_off, va, types_base_va, ps, legacy, ctx)?;
+    let t = parse_type_at(data, file_off, va, types_base_va, abi, ctx)?;
     // Validate this is a real descriptor, not a mid-descriptor / non-type
     // address a stray reference pointed at: the kind must be known and the
     // name must be clean (Go type names never contain control characters).
@@ -891,11 +882,10 @@ pub fn type_at_va<'a>(
 /// (typically `typelink`), e.g. a struct used only as a pointer's element.
 pub fn extract_all_types<'a>(
     ctx: &'a BinaryContext<'a>,
-    ptr_size: u8,
     seeds: Vec<GoType<'a>>,
     types_base: u64,
     etypes: u64,
-    legacy: bool,
+    abi: TypeAbi,
 ) -> Vec<GoType<'a>> {
     const CAP: usize = 2_000_000;
     // Every Go type descriptor lives in [types, etypes). Bounding the traversal
@@ -917,7 +907,7 @@ pub fn extract_all_types<'a>(
         if !in_range(va) || !visited.insert(va) {
             continue;
         }
-        let t = match type_at_va(ctx, va, types_base, ptr_size, legacy) {
+        let t = match type_at_va(ctx, va, types_base, abi) {
             Some(t) => t,
             None => continue,
         };
@@ -1030,10 +1020,14 @@ fn build_go_type<'a>(
     type_data: &'a [u8],
     full_data: &'a [u8],
     types_base_va: u64,
-    ps: u8,
-    legacy: bool,
+    abi: TypeAbi,
     ctx: &BinaryContext<'a>,
 ) -> Option<GoType<'a>> {
+    let TypeAbi {
+        ps,
+        legacy_names: legacy,
+        map_layout,
+    } = abi;
     let kind = TypeKind::from_raw(abi_type.kind());
 
     // Resolve name via Str (NameOff from types base)
@@ -1119,15 +1113,12 @@ fn build_go_type<'a>(
             .unwrap_or(TypeDetail::None),
         TypeKind::Map => type_data
             .get(base_sz..)
-            .and_then(|d| MapTypeExtra::parse(d, ps))
+            .and_then(|d| MapTypeExtra::parse(d, ps, map_layout))
             .map(|m| TypeDetail::Map {
                 key_va: m.key,
                 elem_va: m.elem,
                 group_va: m.group,
-                hasher_va: m.hasher,
-                key_stride: m.key_stride,
-                elem_stride: m.elem_stride,
-                flags: m.flags,
+                extra: Box::new(m),
             })
             .unwrap_or(TypeDetail::None),
         TypeKind::Pointer => type_data
@@ -1167,7 +1158,9 @@ fn build_go_type<'a>(
             TypeKind::Func => align_up(base_sz.saturating_add(FuncTypeExtra::SIZE), ps as usize)?
                 .saturating_sub(base_sz),
             TypeKind::Interface => InterfaceTypeExtra::size(ps),
-            TypeKind::Map => MapTypeExtra::size(ps),
+            TypeKind::Map => {
+                MapTypeExtra::size(ps, map_layout.resolve_for(type_data.get(base_sz..)?, ps))
+            }
             TypeKind::Pointer | TypeKind::Slice => ElemTypeExtra::size(ps),
             TypeKind::Struct => StructTypeExtra::size(ps),
             _ => 0,

@@ -2,11 +2,10 @@
 #
 # Rebuild every test fixture under tests/samples/ from the sources in src/.
 #
-# ONE script for the whole corpus. It runs on a linux/amd64 host and is largely
+# ONE script for the whole corpus. It runs on a linux/amd64 host and is fully
 # self-contained: it downloads each released Go toolchain from go.dev on demand
-# — no system Go and no container engine. (The single exception is the
-# unreleased go127/V5 fixture, built via a gotip tree the caller bootstraps; see
-# the gotip note below.) A linux host is used because the pre-1.16 toolchains
+# — no system Go, no container engine, no gotip bootstrap. A linux host is used
+# because the pre-1.16 toolchains
 # have no darwin/arm64 build (and crash under qemu user-emulation), while every
 # modern format (Mach-O / PE / Wasm) cross-compiles cleanly from linux. The cgo
 # harness needs a host C compiler (gcc), which a linux/amd64 box has.
@@ -56,7 +55,9 @@ mkdir -p "$OUT" "$CACHE" "$WORK"
 #   go18  1.8.7   +textsectmap, ptab, pluginpath, pkghashes
 #   go19  1.9.7   V1 tail without hasmain/bad
 #   go110 1.10.8  +hasmain, +bad
-#   go112 1.12.17 _func gains funcID
+#   go111 1.11.13 maptype drops the `hmap` type pointer
+#   go112 1.12.17 _func gains funcID; maptype bools collapse into `flags`
+#   go113 1.13.15 last maptype without `hasher` (added in 1.14)
 #   go115 1.15.15 last Go12-pclntab release
 #   go116 1.16.15 new pcHeader (magic Go116); moduledata V2
 #   go117 1.17.13 last Go116-magic
@@ -66,16 +67,19 @@ mkdir -p "$OUT" "$CACHE" "$WORK"
 #   go123 1.23.12 interior V3 sample
 #   go124 1.24.13 GOFIPS140 available
 #   go125 1.25.11 interior V3 sample
-#   go126 1.26.4  moduledata V4 (+epclntab); newest stable anchor
+#   go126 1.26.4  moduledata V4 (+epclntab)
+#   go127 1.27.1  moduledata V5 (-typelinks/-itablinks, +typedesclen,
+#                 +itaboffset/itabsize); `.go.type`/`.go.func` sections;
+#                 abi.MapType gains the split-group stride fields; newest
+#                 stable anchor
 # ---------------------------------------------------------------------------
-# go127 (moduledata V5) is the unreleased 1.27 dev tree, built via gotip; it is
-# skipped automatically when $HOME/sdk/gotip is absent.
 VERSIONS=(
   "go12:1.2.2"   "go14:1.4.3"   "go15:1.5.4"   "go17:1.7.6"   "go18:1.8.7"
-  "go19:1.9.7"   "go110:1.10.8" "go112:1.12.17" "go115:1.15.15"
+  "go19:1.9.7"   "go110:1.10.8" "go111:1.11.13" "go112:1.12.17" "go113:1.13.15"
+  "go115:1.15.15"
   "go116:1.16.15" "go117:1.17.13" "go118:1.18.10" "go120:1.20.14"
   "go121:1.21.13" "go123:1.23.12" "go124:1.24.13" "go125:1.25.11" "go126:1.26.4"
-  "go127:tip"
+  "go127:1.27.1"
 )
 
 # Anchor versions that get cross-compiled format variants. Mach-O/PE build from
@@ -83,17 +87,19 @@ VERSIONS=(
 FORMAT_ANCHORS=("go116" "go120" "go124" "go126" "go127")
 WASIP1_ANCHORS=("go121" "go124" "go126" "go127")
 # Versions that get a `types` harness (the type system arrived in Go 1.7).
-TYPES_VERSIONS=("go17" "go110" "go116" "go120" "go126")
+# `go123` and `go126` bracket the two `abi.MapType` layout changes (buckets ->
+# Swiss in 1.24, Swiss -> split-group strides in 1.27), which the map-descriptor
+# stride assertions in `mod matrix` depend on.
+TYPES_VERSIONS=(
+  "go17" "go110" "go111" "go112" "go113" "go116" "go120" "go123" "go126" "go127"
+)
 # Versions that get a `generics` harness (type parameters arrived in Go 1.18).
-GENERICS_VERSIONS=("go118" "go120" "go124" "go126")
+GENERICS_VERSIONS=("go118" "go120" "go124" "go126" "go127")
 # Versions that get a `cgo` harness (linux/amd64, CGO_ENABLED=1 + host gcc).
-CGO_VERSIONS=("go116" "go126")
+CGO_VERSIONS=("go116" "go126" "go127")
 
 # Minor version of a tag/full-version string ("1.9.7" -> 9, "go116" -> 16).
-# The unreleased tip toolchain (Go 1.27 dev) maps to a large sentinel so all the
-# ">= N" feature gates treat it as newest.
 minor_of() {
-  [[ "$1" == "tip" || "$1" == "go127" ]] && { echo 99; return; }
   local v="${1#go1}"; v="${v#1.}"; echo "${v%%.*}"
 }
 in_list() { local x=$1; shift; local e; for e in "$@"; do [[ "$e" == "$x" ]] && return 0; done; return 1; }
@@ -110,8 +116,10 @@ selected() {
 # Download + extract a toolchain into the cache (idempotent); echo its GOROOT.
 fetch_toolchain() {  # fetch_toolchain <full-version>
   local v="$1"
-  # Go 1.27 is unreleased: use a gotip tree the caller bootstrapped into
-  # $HOME/sdk/gotip (`go install golang.org/dl/gotip@latest && gotip download`).
+  # An unreleased dev toolchain (for the *next* Go, when one is being tracked
+  # ahead of its release) can be bootstrapped into $HOME/sdk/gotip with
+  # `go install golang.org/dl/gotip@latest && gotip download`; the matrix uses
+  # released versions only, so this branch is normally unused.
   if [[ "$v" == "tip" ]]; then
     [[ -x "$HOME/sdk/gotip/bin/go" ]] && echo "$HOME/sdk/gotip" || return 1
     return 0
@@ -216,10 +224,65 @@ for entry in "${VERSIONS[@]}"; do
            build "$tag" "$ver" basic   darwin  arm64 "_fips" GOFIPS140=v1.0.0 ;;
     go127) build "$tag" "$ver" basic   darwin  arm64 "_stripped" -ldflags "-s -w"
            build "$tag" "$ver" basic   windows amd64 "_stripped" -ldflags "-s -w"
-           build "$tag" "$ver" types   linux   amd64 ""
-           build "$tag" "$ver" generics linux  amd64 "" ;;
+           build "$tag" "$ver" basic   linux   amd64 "_stripped" -ldflags "-s -w"
+           build "$tag" "$ver" basic   linux   amd64 "_cover" -cover
+           build "$tag" "$ver" basic   linux   amd64 "_fips" GOFIPS140=v1.0.0
+           # -buildmode=pie moves every read-only-relocatable Go section under
+           # a `.data.rel.ro` prefix (`.data.rel.ro.go.type`, and pre-1.27
+           # `.data.rel.ro.typelink`). Without a PIE fixture the section
+           # classifier's prefix stripping is untested, and an unprefixed
+           # lookup makes a PIE binary look like it has no typelink section at
+           # all — which the moduledata arbitration reads as a Go 1.27 signal.
+           build "$tag" "$ver" basic   linux   amd64 "_pie" -buildmode=pie
+           build "$tag" "$ver" minimal linux   amd64 ""
+           build "$tag" "$ver" embed   linux   amd64 ""
+           build "$tag" "$ver" embed   linux   amd64 "_stripped" -ldflags "-s -w"
+           # A wasm embed fixture pins the one case where the address-space
+           # view is not the file: `embed.FS` recovery searches the
+           # reconstructed linear-memory image, so any attempt to narrow that
+           # search with file-offset section ranges silently finds nothing.
+           build "$tag" "$ver" embed   wasip1  wasm  "" ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Derived fixtures: produced by post-processing a built binary rather than by
+# invoking a toolchain.
+# ---------------------------------------------------------------------------
+
+# A Go binary with every occurrence of its version string overwritten, the way
+# an obfuscator (garble) or a repacker leaves one. With no version to key on,
+# the moduledata parser has to pick its layout from structural evidence alone —
+# and on PE, which never carries a `.typelink` section, the only hint points at
+# the Go 1.27 layout. Guessing wrong there silently empties the types, itabs,
+# init tasks and inline tree, so this fixture pins the arbitration.
+scrub_version() {  # scrub_version <src-name> <dst-name> <version-literal>
+  local src="$OUT/$1" dst="$OUT/$2" lit="$3"
+  if [[ $list_only -eq 1 ]]; then echo "  $2"; return 0; fi
+  if [[ ! -s "$src" ]]; then echo "  !! $2: missing source $1"; fail+=("$2"); return 0; fi
+  echo "  $2"
+  if python3 - "$src" "$dst" "$lit" <<'PYEOF'
+import sys
+
+src, dst, lit = sys.argv[1], sys.argv[2], sys.argv[3].encode()
+data = bytearray(open(src, "rb").read())
+n = 0
+i = data.find(lit)
+while i >= 0:
+    data[i : i + len(lit)] = b"\x00" * len(lit)
+    n += 1
+    i = data.find(lit, i + len(lit))
+if n == 0:
+    sys.exit(f"no occurrence of {lit!r} in {src}")
+open(dst, "wb").write(bytes(data))
+print(f"    scrubbed {n} occurrence(s)")
+PYEOF
+  then ok=$((ok + 1)); else echo "    !! scrub failed"; rm -f "$dst"; fail+=("$2"); fi
+}
+
+if [[ ${#SELECT[@]} -eq 0 ]] || selected go124; then
+  scrub_version basic_go124_windows_amd64.exe basic_go124_windows_amd64_noversion.exe go1.24
+fi
 
 if [[ $list_only -eq 1 ]]; then exit 0; fi
 echo "Done. Built $ok fixtures into $OUT."

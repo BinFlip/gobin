@@ -37,12 +37,23 @@ use crate::{
     structures::pclntab::{FuncData, FuncEntryIter, ParsedPclntab},
 };
 
-/// Whether `pkg` is a Go runtime package (`runtime` or `runtime/<sub>`).
+/// Whether `pkg` is a Go runtime package.
+///
+/// Covers all three spellings the runtime has used: `runtime` itself,
+/// `runtime/<sub>` (e.g. `runtime/cgo`, and the pre-1.24 `runtime/internal/*`
+/// tree), and `internal/runtime/<sub>` — the home the runtime's internal
+/// packages (`internal/runtime/atomic`, `internal/runtime/maps`,
+/// `internal/runtime/sys`, …) moved to in Go 1.24 and where they still live in
+/// 1.27. Without the third form, half the runtime of a modern binary
+/// classifies as ordinary internal library code.
 ///
 /// Shared with [`crate::structures::types::GoType::is_runtime`] so type-side
 /// and function-side classifications agree on one canonical rule.
 pub fn is_runtime_path(pkg: &str) -> bool {
-    pkg == "runtime" || pkg.starts_with("runtime/")
+    pkg == "runtime"
+        || pkg.starts_with("runtime/")
+        || pkg == "internal/runtime"
+        || pkg.starts_with("internal/runtime/")
 }
 
 /// Whether `pkg` is a Go-internal package (runtime, `internal/*`, `vendor/*`,

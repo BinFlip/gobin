@@ -3,14 +3,16 @@
 //! Go binaries can be ELF (Linux, FreeBSD, etc.), Mach-O (macOS, iOS), or PE (Windows).
 //! Each format stores Go metadata in differently-named sections:
 //!
-//! | Structure   | ELF Section          | Mach-O Section      | PE Section    |
-//! |-------------|----------------------|---------------------|---------------|
-//! | pclntab     | `.gopclntab`         | `__gopclntab`       | (in `.rdata`) |
-//! | Build info  | `.go.buildinfo`      | `__go_buildinfo`    | (in `.data`)  |
-//! | Module data | `.go.module`         | `__go_module`       | (in `.data`)  |
-//! | Build ID    | `.note.go.buildid`   | (raw marker)        | (raw marker)  |
-//! | Type links  | `.typelink`          | (in `__rodata`)     | (in `.rdata`) |
-//! | Itab links  | `.itablink`          | (in `__rodata`)     | (in `.rdata`) |
+//! | Structure         | ELF Section          | Mach-O Section      | PE Section    |
+//! |-------------------|----------------------|---------------------|---------------|
+//! | pclntab           | `.gopclntab`         | `__gopclntab`       | (in `.rdata`) |
+//! | Build info        | `.go.buildinfo`      | `__go_buildinfo`    | (in `.data`)  |
+//! | Module data       | `.go.module`         | `__go_module`       | (in `.data`)  |
+//! | Build ID          | `.note.go.buildid`   | (raw marker)        | (raw marker)  |
+//! | Type links ≤1.26  | `.typelink`          | `__typelink`        | (in `.rdata`) |
+//! | Itab links ≤1.26  | `.itablink`          | `__itablink`        | (in `.rdata`) |
+//! | Type region 1.27+ | `.go.type`           | `__go_type`         | (in `.rdata`) |
+//! | `go:funcdesc` 1.27+ | `.go.func`         | `__go_func`         | (in `.rdata`) |
 //!
 //! For PE binaries, Go does not create dedicated section names. Instead, the pclntab
 //! lives inside `.rdata` and the build info lives inside `.data`. Detection falls back
@@ -47,6 +49,14 @@ use crate::{
         wasm::{build_linear_memory_image, walk as walk_wasm_sections},
     },
 };
+
+/// Wasm section id of the Code section, which holds the module's function
+/// bodies — the wasm equivalent of `.text`.
+const WASM_CODE_SECTION_ID: u8 = 10;
+
+/// Wasm section id of the Data section, which holds every initialized byte of
+/// a module's linear memory.
+const WASM_DATA_SECTION_ID: u8 = 11;
 
 /// The executable format of the binary being analyzed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +119,50 @@ pub struct GoSections {
     pub go_buildinfo: Option<SectionRange>,
     /// File byte range of the moduledata section.
     pub go_module: Option<SectionRange>,
-    /// File byte range of the typelink section (ELF only).
+    /// File byte range of the typelink section (ELF / Mach-O, Go ≤ 1.26).
+    /// Removed by Go 1.27, which replaced the typelink array with a walk over
+    /// the type-descriptor region — see [`Self::go_type`].
     pub typelink: Option<SectionRange>,
-    /// File byte range of the itablink section (ELF only).
+    /// File byte range of the itablink section (ELF / Mach-O, Go ≤ 1.26).
+    /// Removed by Go 1.27, which stores itabs inline in the types region.
     pub itablink: Option<SectionRange>,
+    /// File byte range of the type-descriptor section (`.go.type` /
+    /// `__go_type`, Go 1.27+). Spans exactly `[moduledata.types,
+    /// moduledata.etypes)`, so its presence is a positive V5-layout signal and
+    /// its bounds locate the type region without a moduledata. Absent on PE
+    /// (which keeps everything in `.rdata`) and on wasm.
+    pub go_type: Option<SectionRange>,
+    /// File byte range of the `go:funcdesc` section (`.go.func` / `__go_func`,
+    /// Go 1.27+) — the `·f` function-value descriptors that used to sit in
+    /// `.rodata`. Recorded as a Go 1.27 structural marker.
+    pub go_func: Option<SectionRange>,
     /// File byte range of the FIPS-140 info section (`.go.fipsinfo` /
     /// `__go_fipsinfo`, Go 1.24+). Present only in FIPS-mode builds.
     pub fipsinfo: Option<SectionRange>,
+    /// File byte range of the non-pointer initialized data section
+    /// (`.noptrdata` / `__noptrdata`), where the Go linker emits
+    /// `runtime.firstmoduledata` before the dedicated `.go.module` section
+    /// existed. Searched first by [`crate::structures::locate`]'s scan, which
+    /// is otherwise a whole-image sweep.
+    pub noptrdata: Option<SectionRange>,
+    /// File byte range of the initialized data section (`.data` / `__data`),
+    /// or — for wasm, which has no named sections — of the Data section
+    /// payload. PE merges every Go data symbol into `.data`, so it is the PE
+    /// equivalent of `noptrdata` for moduledata discovery.
+    ///
+    /// Like every range in this struct this is a **file** offset. For wasm
+    /// that is *not* an offset into
+    /// [`BinaryContext::structure_search_data`], which presents the
+    /// reconstructed linear-memory image instead; callers that search through
+    /// that view must not use this range to narrow it.
+    pub data_section: Option<SectionRange>,
+    /// File byte range of the executable text section (`.text` / `__text`).
+    ///
+    /// Not a Go-specific section, but the Go linker places `runtime.text` at
+    /// its start on every format, which makes it the last-resort source for
+    /// [`crate::GoBinary::text_va`] on binaries whose moduledata cannot be
+    /// located.
+    pub text_section: Option<SectionRange>,
 }
 
 /// A contiguous byte range within the binary file, with its virtual address.
@@ -201,7 +248,12 @@ impl<'a> BinaryContext<'a> {
             go_module: None,
             typelink: None,
             itablink: None,
+            go_type: None,
+            go_func: None,
             fipsinfo: None,
+            noptrdata: None,
+            data_section: None,
+            text_section: None,
         };
         let mut segments = Vec::new();
         let mut elf_note_segments = Vec::new();
@@ -347,6 +399,30 @@ impl<'a> BinaryContext<'a> {
                     // payload bytes inside the section.
                     sections.has_go_buildid_note = true;
                 }
+                if sec.id == WASM_CODE_SECTION_ID && sec.payload_size > 0 {
+                    // The Code section is wasm's executable region. Recorded
+                    // under `text_section` so the structural searches skip it
+                    // exactly as they skip `.text` elsewhere — it is the
+                    // largest part of a Go wasm module and can hold none of
+                    // the data structures they look for.
+                    sections.text_section = Some(SectionRange {
+                        offset: sec.payload_offset,
+                        size: sec.payload_size,
+                        va: 0,
+                    });
+                }
+                if sec.id == WASM_DATA_SECTION_ID && sec.payload_size > 0 {
+                    // Every initialized byte a Go wasm module has lives in the
+                    // Data section, so its file range bounds the searches that
+                    // would otherwise sweep the whole module. Recorded with
+                    // `va: 0` because wasm addresses are linear-memory offsets
+                    // that this file range does not carry.
+                    sections.data_section = Some(SectionRange {
+                        offset: sec.payload_offset,
+                        size: sec.payload_size,
+                        va: 0,
+                    });
+                }
             }
             // Reconstruct the linear-memory image. Cap at 256 MB so an
             // adversarial wasm with absurd offsets can't blow our memory.
@@ -388,6 +464,65 @@ impl<'a> BinaryContext<'a> {
             wasm_lm,
             rebased,
         }
+    }
+
+    /// Byte ranges of [`Self::data`] — i.e. **file** offsets — that can hold
+    /// Go data structures, in order and non-overlapping.
+    ///
+    /// Callers that search through [`Self::structure_search_data`] want
+    /// [`Self::search_regions`] instead; for wasm the two views share no
+    /// offsets.
+    ///
+    /// Several extraction surfaces have no symbol to look up and must search
+    /// memory structurally — the build-info blob, `embed.FS` file arrays, the
+    /// moduledata. All of them are *data*, so the two largest regions of a Go
+    /// binary can be excluded outright: the executable section (`.text`,
+    /// `__text`, or a wasm Code section) and the pclntab, which is a
+    /// self-contained table in its own encoding. Together those are typically
+    /// more than half the image.
+    ///
+    /// Returns the whole range when the section table names neither, so a
+    /// stripped or unusual binary loses no coverage.
+    pub fn data_regions(&self) -> Vec<(usize, usize)> {
+        let len = self.data.len();
+        let mut skip: Vec<(usize, usize)> = [self.sections.text_section, self.sections.gopclntab]
+            .into_iter()
+            .flatten()
+            .map(|r| (r.offset.min(len), r.offset.saturating_add(r.size).min(len)))
+            .filter(|(a, b)| b > a)
+            .collect();
+        skip.sort_unstable();
+
+        let mut regions = Vec::new();
+        let mut cursor = 0usize;
+        for (from, to) in skip {
+            if from > cursor {
+                regions.push((cursor, from));
+            }
+            cursor = cursor.max(to);
+        }
+        if cursor < len {
+            regions.push((cursor, len));
+        }
+        regions
+    }
+
+    /// The same idea as [`Self::data_regions`], but as ranges into
+    /// [`Self::structure_search_data`] — the view every structural parser
+    /// actually reads through.
+    ///
+    /// For ELF, Mach-O and PE that view is the file (or, for a chained-fixup
+    /// Mach-O, a rebased copy with identical layout), so the file ranges carry
+    /// over unchanged. For wasm it is the reconstructed linear-memory image,
+    /// whose offsets are linear-memory addresses unrelated to file positions —
+    /// and which is *entirely* initialized data, so there is nothing to
+    /// exclude.
+    pub fn search_regions(&self) -> Vec<(usize, usize)> {
+        if self.format == BinaryFormat::Wasm {
+            let len = self.structure_search_data().len();
+            return if len > 0 { vec![(0, len)] } else { Vec::new() };
+        }
+        self.data_regions()
     }
 
     /// The raw binary data this context was built from.
@@ -544,7 +679,18 @@ pub fn detect_format(data: &[u8]) -> BinaryFormat {
 }
 
 /// Classify a section by name and record it into the appropriate GoSections field.
+///
+/// ELF links that use RELRO (`-buildmode=pie` / `c-shared` / `c-archive`)
+/// rename every read-only-relocatable Go section with a `.data.rel.ro` prefix
+/// (`cmd/link/internal/ld/data.go`, `genrelrosecname`), so `.typelink` becomes
+/// `.data.rel.ro.typelink` and `.go.type` becomes `.data.rel.ro.go.type`. The
+/// prefix is stripped before matching — otherwise a PIE binary looks like it
+/// has no typelink section at all, which the moduledata layout arbitration
+/// reads as a Go 1.27 signal.
 fn classify_section(name: &str, range: Option<SectionRange>, result: &mut GoSections) {
+    // `.data.rel.ro` itself (the empty-suffix RELRO section) strips to "" and
+    // matches nothing, which is what we want.
+    let name = name.strip_prefix(".data.rel.ro").unwrap_or(name);
     match name {
         ".gopclntab" | "__gopclntab" => {
             result.has_gopclntab = true;
@@ -566,8 +712,23 @@ fn classify_section(name: &str, range: Option<SectionRange>, result: &mut GoSect
         ".itablink" | "__itablink" => {
             result.itablink = range;
         }
+        ".go.type" | "__go_type" => {
+            result.go_type = range;
+        }
+        ".go.func" | "__go_func" => {
+            result.go_func = range;
+        }
         ".go.fipsinfo" | "__go_fipsinfo" => {
             result.fipsinfo = range;
+        }
+        ".text" | "__text" => {
+            result.text_section = range;
+        }
+        ".noptrdata" | "__noptrdata" => {
+            result.noptrdata = range;
+        }
+        ".data" | "__data" => {
+            result.data_section = range;
         }
         _ => {}
     }

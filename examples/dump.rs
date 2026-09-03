@@ -205,6 +205,9 @@ fn print_report(report: &ConfidenceReport) {
                 eprintln!("  [+] buildinfo section present")
             }
             ConfidenceSignal::BuildidNotePresent => eprintln!("  [+] build-id note present"),
+            ConfidenceSignal::TypeSectionPresent { section } => {
+                eprintln!("  [+] type-metadata section present: {section}");
+            }
             ConfidenceSignal::BuildIdMarkerFound => eprintln!("  [+] build-id raw marker found"),
             ConfidenceSignal::BuildinfoParsed => eprintln!("  [+] buildinfo blob parsed"),
             ConfidenceSignal::BuildinfoMissing { reason } => {

@@ -131,6 +131,15 @@ pub enum ConfidenceSignal {
     BuildinfoSectionPresent,
     /// ELF `.note.go.buildid` (or `Go\0\0` note marker) was present.
     BuildidNotePresent,
+    /// A Go type-metadata section was present. These names are unique to the
+    /// Go linker, so any of them is structural proof on its own — useful on
+    /// stripped binaries where `.gopclntab` was renamed away.
+    TypeSectionPresent {
+        /// Which section matched, in its ELF spelling (`".typelink"`,
+        /// `".itablink"`, `".go.type"`, `".go.func"`). Mach-O spellings map
+        /// onto the same values.
+        section: &'static str,
+    },
     /// Build ID raw marker (`\xff Go build ID:`) was found.
     BuildIdMarkerFound,
     /// Build info blob was successfully parsed.
@@ -252,8 +261,57 @@ pub fn heuristic_hits(data: &[u8]) -> usize {
 /// ~100MB, needles of 10-40 bytes), this is fast enough and avoids pulling in a
 /// heavier substring search dependency.
 pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+    let (first, rest) = needle.split_first()?;
+    // Anchor on the first byte, then compare the tail only at candidates.
+    // `windows(n).position` compares every candidate window in full, which is
+    // the dominant cost of the whole-image searches PE and wasm binaries force
+    // when there is no section to narrow them to.
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let mut from = 0usize;
+    while from <= last_start {
+        let window = haystack.get(from..)?;
+        let hit = find_byte(window, *first)?;
+        let start = from.checked_add(hit)?;
+        if start > last_start {
+            return None;
+        }
+        let tail_start = start.checked_add(1)?;
+        let tail_end = tail_start.checked_add(rest.len())?;
+        if haystack.get(tail_start..tail_end) == Some(rest) {
+            return Some(start);
+        }
+        from = tail_start;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    None
+}
+
+/// Index of the first occurrence of `byte` in `haystack`.
+///
+/// Eight bytes are tested per iteration with the classic SWAR zero-byte trick:
+/// XOR-ing the word against a broadcast of the target turns "contains `byte`"
+/// into "contains a zero byte", which `(x - 0x01..01) & !x & 0x80..80` answers
+/// in three instructions. A byte-at-a-time `position` is roughly an order of
+/// magnitude slower over the megabyte-scale buffers this crate searches, and
+/// pulling in a `memchr` dependency for it is not worth the supply-chain
+/// surface on a crate that otherwise depends only on `goblin`.
+fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
+    const LANES: usize = 8;
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+
+    let broadcast = u64::from_ne_bytes([byte; LANES]);
+    let (words, tail) = haystack.as_chunks::<LANES>();
+    for (i, chunk) in words.iter().enumerate() {
+        let x = u64::from_ne_bytes(*chunk) ^ broadcast;
+        if x.wrapping_sub(LOW) & !x & HIGH == 0 {
+            continue;
+        }
+        let base = i.checked_mul(LANES)?;
+        let hit = chunk.iter().position(|&b| b == byte)?;
+        return base.checked_add(hit);
+    }
+    let consumed = haystack.len().checked_sub(tail.len())?;
+    tail.iter()
+        .position(|&b| b == byte)
+        .and_then(|hit| consumed.checked_add(hit))
 }

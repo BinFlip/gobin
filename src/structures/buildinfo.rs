@@ -102,22 +102,7 @@ const FLAG_VERSION_INL: u8 = 0x02;
 /// For the pointer format (Go < 1.18), only a version string scan is attempted.
 pub fn extract<'a>(ctx: &BinaryContext<'a>) -> Option<BuildInfo<'a>> {
     let data = ctx.data();
-    let sections = ctx.sections();
-
-    let search_data = if let Some(ref range) = sections.go_buildinfo {
-        let raw_end = range.offset.checked_add(range.size)?;
-        let end = raw_end.min(data.len());
-        data.get(range.offset..end)?
-    } else {
-        data
-    };
-
-    let magic_pos = find_aligned_magic(search_data)?;
-    let header_start = if let Some(ref range) = sections.go_buildinfo {
-        range.offset.checked_add(magic_pos)?
-    } else {
-        magic_pos
-    };
+    let header_start = find_magic(ctx, data)?;
 
     let header_end = header_start.checked_add(BUILDINFO_HEADER_SIZE)?;
     let header = data.get(header_start..header_end)?;
@@ -151,26 +136,81 @@ pub fn extract<'a>(ctx: &BinaryContext<'a>) -> Option<BuildInfo<'a>> {
     Some(info)
 }
 
-/// Find the magic header at 16-byte alignment within `data`.
+/// Locate the build-info header's offset within `data`.
 ///
-/// The Go linker aligns the build info to 16 bytes (macOS requirement).
-/// We first scan with alignment checking, then fall back to an unaligned scan
-/// in case the section offset shifted the alignment.
+/// `go:buildinfo` is a writable-data symbol (`sym.SBUILDINFO`), so the search
+/// narrows to the regions that can hold it before falling back to the whole
+/// image:
+///
+/// 1. the dedicated `.go.buildinfo` / `__go_buildinfo` section — exact, and
+///    the usual case for ELF and Mach-O;
+/// 2. the `.data` / `.noptrdata` sections — PE merges every Go data symbol
+///    into `.data`, which is a small fraction of a Go binary (tens of KB
+///    against megabytes of `.text` and `.rdata`);
+/// 3. the data regions of the image
+///    ([`BinaryContext::data_regions`]), so a stripped or unusual section
+///    table still works.
+fn find_magic(ctx: &BinaryContext<'_>, data: &[u8]) -> Option<usize> {
+    let sections = ctx.sections();
+    let candidates = [
+        sections.go_buildinfo.as_ref(),
+        sections.data_section.as_ref(),
+        sections.noptrdata.as_ref(),
+    ];
+    for range in candidates.into_iter().flatten() {
+        let end = range.offset.checked_add(range.size)?.min(data.len());
+        if let Some(region) = data.get(range.offset..end)
+            && let Some(pos) = find_aligned_magic(region)
+        {
+            return range.offset.checked_add(pos);
+        }
+    }
+    // Fall back to a sweep, but only over the regions that can hold data: the
+    // blob is a `sym.SBUILDINFO` symbol, so the executable section and the
+    // pclntab are excluded. That matters most for wasm, which names no
+    // sections at all and would otherwise sweep the whole module — twice, once
+    // per candidate list above — to prove a blob it never carries is absent.
+    for (from, to) in ctx.data_regions() {
+        if let Some(region) = data.get(from..to)
+            && let Some(pos) = find_aligned_magic(region)
+        {
+            return from.checked_add(pos);
+        }
+    }
+    None
+}
+
+/// Find the build-info magic within `data`, preferring a 16-byte-aligned hit.
+///
+/// The Go linker aligns the symbol to [`BUILDINFO_ALIGN`] (a macOS
+/// requirement), so an aligned occurrence is the real one; an unaligned hit is
+/// still returned as a fallback in case a section offset shifted the
+/// alignment. Both are answered in a **single** sweep — the previous
+/// aligned-then-unaligned pair walked the buffer twice, which on PE and wasm
+/// (neither of which has a `.go.buildinfo` section to narrow the search) meant
+/// scanning the whole image twice over.
 fn find_aligned_magic(data: &[u8]) -> Option<usize> {
-    let mut pos: usize = 0;
-    while let Some(end) = pos.checked_add(BUILDINFO_HEADER_SIZE) {
-        if end > data.len() {
+    let mut first_unaligned: Option<usize> = None;
+    let mut from: usize = 0;
+    while let Some(rel) = data
+        .get(from..)
+        .and_then(|d| find_bytes(d, BUILDINFO_MAGIC))
+    {
+        let at = from.checked_add(rel)?;
+        // A hit with no room for the full header cannot be the build info.
+        if at
+            .checked_add(BUILDINFO_HEADER_SIZE)
+            .is_none_or(|e| e > data.len())
+        {
             break;
         }
-        let window = data.get(pos..)?;
-        if window.starts_with(BUILDINFO_MAGIC)
-            && (pos.checked_rem(BUILDINFO_ALIGN) == Some(0) || pos == 0)
-        {
-            return Some(pos);
+        if at.checked_rem(BUILDINFO_ALIGN) == Some(0) {
+            return Some(at);
         }
-        pos = pos.checked_add(1)?;
+        first_unaligned.get_or_insert(at);
+        from = at.checked_add(1)?;
     }
-    find_bytes(data, BUILDINFO_MAGIC)
+    first_unaligned
 }
 
 /// Read a varint-length-prefixed UTF-8 string, returning the string (borrowed)

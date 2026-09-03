@@ -14,7 +14,16 @@
 //! | V4      | 1.26        | +epclntab                                          |
 //! | V5      | 1.27+       | -typelinks, -itablinks, +typedesclen, +itaboffset  |
 //!
-//! Source: `src/runtime/symtab.go` (field offsets verified per release tag).
+//! Source: `src/runtime/symtab.go` (field offsets verified per release tag,
+//! most recently against `go1.27.1`).
+//!
+//! ## Picking a layout
+//!
+//! V5 moved `types`' neighbours, so a wrong guess shifts every field from
+//! `etypes` onward while still passing a head-only validity check. The
+//! out-of-band signals in [`LayoutHints`] are not sufficient on their own — PE
+//! carries no `.typelink` section at *any* Go version — so [`Moduledata::parse`]
+//! parses both candidates and keeps the one that is internally consistent.
 
 use crate::structures::{
     PclntabVersion,
@@ -263,20 +272,159 @@ pub enum ModuledataVersion {
     V5,
 }
 
+/// Out-of-band signals used to pick the moduledata layout.
+///
+/// Everything here is derived from the *containing binary* rather than from
+/// the moduledata bytes themselves, so it has to be threaded in by the caller.
+/// Grouping the signals keeps [`Moduledata::parse`] from growing a row of
+/// positional booleans whose meaning is invisible at the call site.
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutHints {
+    /// pclntab magic of the binary, which fixes the Go-version floor: `Go118`
+    /// implies 1.18+ (`rodata`/`gofunc`), `Go120` implies 1.20+ (`covctrs`).
+    pub pclntab_version: PclntabVersion,
+    /// Go minor version, when a version string was recovered. `None` for
+    /// binaries whose version was stripped or obfuscated away.
+    pub go_minor: Option<u32>,
+    /// Whether a `.typelink` / `__typelink` section was found. Its *absence*
+    /// is weak evidence of Go 1.27+ — PE, wasm, and RELRO ELF links spelled
+    /// `.data.rel.ro.typelink` have no such section at any version — so it is
+    /// never used alone. See [`Moduledata::parse`].
+    pub has_typelink_section: bool,
+    /// Whether a `.go.type` / `__go_type` section was found. This one *is* a
+    /// positive Go 1.27+ signal: the section did not exist before.
+    pub has_go_type_section: bool,
+}
+
+impl LayoutHints {
+    /// Whether the pclntab magic proves Go 1.18+, i.e. `rodata` and `gofunc`
+    /// are present in the moduledata.
+    fn has_rodata_gofunc(&self) -> bool {
+        matches!(
+            self.pclntab_version,
+            PclntabVersion::Go118 | PclntabVersion::Go120
+        )
+    }
+
+    /// Whether the pclntab magic proves Go 1.20+, i.e. the `covctrs` /
+    /// `ecovctrs` pair is present (it sits *before* `types`, so its presence
+    /// shifts every later field).
+    fn has_covctrs(&self) -> bool {
+        matches!(self.pclntab_version, PclntabVersion::Go120)
+    }
+
+    /// Whether the V5 (Go 1.27+) layout should be tried before the pre-V5 one.
+    ///
+    /// V5 needs the Go 1.20+ magic as a floor. Beyond that, a `.go.type`
+    /// section settles it outright; otherwise we fall back to the weak
+    /// "no typelink section" signal, which only counts when the recovered
+    /// version agrees (or there is no version to disagree).
+    fn prefer_v5(&self) -> bool {
+        self.has_covctrs()
+            && (self.has_go_type_section
+                || (!self.has_typelink_section && self.go_minor.is_none_or(|m| m >= 27)))
+    }
+}
+
 impl Moduledata {
     /// Parse a moduledata from raw bytes with version detection.
     ///
     /// Field presence is determined per-field:
     /// 1. pclntab magic Go120 -> has `covctrs`/`rodata`/`gofunc` (Go 1.20+)
     /// 2. Go minor version -> `inittasks` (1.21+), `epclntab` (1.26+)
-    /// 3. absent `.typelink` section (+ minor >= 27 when known) -> V5 layout
-    pub fn parse(
-        data: &[u8],
-        ps: u8,
-        pclntab_version: PclntabVersion,
-        has_typelink_section: bool,
-        go_version_minor: Option<u32>,
-    ) -> Option<Self> {
+    /// 3. V5 (Go 1.27+) -> see below
+    ///
+    /// # Choosing between the V5 and pre-V5 layouts
+    ///
+    /// V5 moved `types`' neighbours around (`+typedesclen`, `+itaboffset`,
+    /// `+itabsize`, `-typelinks`, `-itablinks`), so guessing wrong shifts every
+    /// field from `etypes` onward and yields a moduledata that still passes a
+    /// head-only validity check — `minpc`/`maxpc`/`funcnametab` are ahead of
+    /// the divergence — while silently reporting an empty types region, no
+    /// itabs, no init tasks and `has_main == false`.
+    ///
+    /// The hints alone cannot settle it: PE never emits a `.typelink` section
+    /// at any Go version, so on a PE binary whose version string was scrubbed
+    /// the only remaining signal points the wrong way. Instead of trusting the
+    /// hints, this parses *both* candidate layouts (hint-preferred first) and
+    /// returns the first one that is internally self-consistent — see
+    /// [`Moduledata::layout_self_consistent`]. Only if neither validates does
+    /// the hint-preferred layout win, so callers still get the head fields.
+    pub fn parse(data: &[u8], ps: u8, hints: LayoutHints) -> Option<Self> {
+        // The Go 1.5-1.15 moduledata has an entirely different head and is
+        // parsed separately; it has no V5/pre-V5 ambiguity.
+        if hints.pclntab_version == PclntabVersion::Go12 {
+            return Self::parse_go12_legacy(data, ps, hints.go_minor);
+        }
+
+        let prefer_v5 = hints.prefer_v5();
+        for v5 in [prefer_v5, !prefer_v5] {
+            // V5 requires the Go 1.20+ magic; never consider it below that.
+            if v5 && !hints.has_covctrs() {
+                continue;
+            }
+            if let Some(md) = Self::parse_modern(data, ps, hints, v5)
+                && md.layout_self_consistent()
+            {
+                return Some(md);
+            }
+        }
+        Self::parse_modern(data, ps, hints, prefer_v5)
+    }
+
+    /// Whether the parsed layout is internally consistent — the arbiter used by
+    /// [`Self::parse`] to decide whether it guessed V5 correctly.
+    ///
+    /// Checks only relationships that hold in *every* real Go image, so a
+    /// correctly-guessed layout always passes and a mis-guessed one reliably
+    /// fails:
+    ///
+    /// - `etypes >= types`. Reading a V5 moduledata with the pre-V5 layout puts
+    ///   `typedesclen` (a small length) where `etypes` belongs, so `etypes`
+    ///   lands far below `types`.
+    /// - Every V5 sub-region fits inside `[types, etypes)` and the descriptor
+    ///   region precedes the itab region. Reading a pre-V5 moduledata as V5
+    ///   picks up unrelated pointers as `typedesclen`/`itaboffset`, which then
+    ///   dwarf the (collapsed) types span.
+    /// - `rodata`, `gofunc` and `epclntab` are image addresses at or above
+    ///   `text`, never the small integers a misaligned read produces.
+    pub fn layout_self_consistent(&self) -> bool {
+        let Some(span) = self.etypes.checked_sub(self.types) else {
+            return false;
+        };
+        if self.version == ModuledataVersion::V5 {
+            let (Some(typedesclen), Some(itaboffset), Some(itabsize)) =
+                (self.typedesclen, self.itaboffset, self.itabsize)
+            else {
+                return false;
+            };
+            let Some(itab_end) = itaboffset.checked_add(itabsize) else {
+                return false;
+            };
+            // Layout of `.go.type` (cmd/link/internal/ld/data.go, dodataSect
+            // STYPE case): ptrSize skip, `type:*`, typelink descriptors up to
+            // `typedesclen`, non-typelink descriptors, then itabs.
+            if typedesclen > span || itaboffset > span || itab_end > span {
+                return false;
+            }
+            if typedesclen > itaboffset {
+                return false;
+            }
+        }
+        // A misaligned read lands on lengths, flags and slice fields, which
+        // read as small integers rather than addresses inside the image.
+        [self.rodata, self.gofunc, self.epclntab]
+            .into_iter()
+            .flatten()
+            .all(|va| va >= self.text)
+    }
+
+    /// Parse a Go 1.16+ moduledata with the layout fixed by `hints` and the
+    /// explicit `v5` choice. Shared by both arms of [`Self::parse`]'s
+    /// arbitration, which is why the V5 decision is a parameter rather than
+    /// something re-derived here.
+    fn parse_modern(data: &[u8], ps: u8, hints: LayoutHints, v5: bool) -> Option<Self> {
+        let go_version_minor = hints.go_minor;
         let p = ps as usize;
         let slice_sz = GoSlice::size(ps);
         // A Go `string` header is (ptr, len) = 2 pointers.
@@ -306,9 +454,6 @@ impl Moduledata {
         let maxpc = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
 
-        // The Go 1.5-1.15 moduledata has an entirely different head (no
-        // `pcHeader` pointer; `pclntable []byte` first) and is parsed
-        // separately.
         // The middle/tail layout is determined per-field from the pclntab
         // magic and the Go minor version, verified against runtime/symtab.go
         // across releases:
@@ -317,11 +462,7 @@ impl Moduledata {
         //   - inittasks                 : Go 1.21+
         //   - epclntab                  : Go 1.26+ (absent in 1.24 / 1.25!)
         //   - V5 (typedesclen + itaboffset/itabsize, no typelinks/itablinks):
-        //                                 Go 1.27+
-        if pclntab_version == PclntabVersion::Go12 {
-            return Self::parse_go12_legacy(data, ps, go_version_minor);
-        }
-
+        //                                 Go 1.27+, chosen by the caller
         let text = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
         let etext = read_uintptr(data, off, ps)?;
@@ -343,14 +484,8 @@ impl Moduledata {
         // `covctrs` sits *before* `types`, so its presence shifts every later
         // field; `rodata`/`gofunc` sit *after* `etypes`. They were added in
         // different releases (1.20 vs 1.18), so they must be gated separately.
-        let has_covctrs = matches!(pclntab_version, PclntabVersion::Go120);
-        let has_rodata_gofunc = matches!(
-            pclntab_version,
-            PclntabVersion::Go118 | PclntabVersion::Go120
-        );
-        // V5 dropped the `.typelink` section, so its absence is a reliable
-        // structural signal; the version string disambiguates when present.
-        let v5 = has_covctrs && !has_typelink_section && go_version_minor.is_none_or(|m| m >= 27);
+        let has_covctrs = hints.has_covctrs();
+        let has_rodata_gofunc = hints.has_rodata_gofunc();
         let has_inittasks = v5 || go_version_minor.is_none_or(|m| m >= 21);
 
         // covctrs, ecovctrs (Go 1.20+)
@@ -817,13 +952,93 @@ fn looks_like_slice_header(data: &[u8], off: usize, ps: u8) -> bool {
 mod tests {
     use super::*;
 
+    /// Hints for a binary with neither a `.typelink` nor a `.go.type` section
+    /// — the shape a PE, a wasm module, or a stripped RELRO ELF presents.
+    fn hints(pclntab_version: PclntabVersion, go_minor: Option<u32>) -> LayoutHints {
+        LayoutHints {
+            pclntab_version,
+            go_minor,
+            has_typelink_section: false,
+            has_go_type_section: false,
+        }
+    }
+
+    /// Write a little-endian `u64` at `off`.
+    fn put(d: &mut [u8], off: usize, v: u64) {
+        d[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Field offsets of the 64-bit V5 (Go 1.27+) moduledata, counted from the
+    /// `pcHeader` pointer at 0. Derived by walking `parse_modern`'s reads.
+    mod v5_off {
+        pub const TEXT: usize = 176;
+        pub const ETEXT: usize = 184;
+        pub const TYPES: usize = 296;
+        pub const TYPEDESCLEN: usize = 304;
+        pub const ETYPES: usize = 312;
+        pub const ITABOFFSET: usize = 320;
+        pub const ITABSIZE: usize = 328;
+        pub const RODATA: usize = 336;
+        pub const GOFUNC: usize = 344;
+        pub const EPCLNTAB: usize = 352;
+    }
+
+    /// Field offsets of the 64-bit V3 (Go 1.20-1.25) moduledata. Identical to
+    /// V5 up to `types`, then diverges: no `typedesclen`, no itab fields.
+    mod v3_off {
+        pub const TEXT: usize = 176;
+        pub const ETEXT: usize = 184;
+        pub const TYPES: usize = 296;
+        pub const ETYPES: usize = 304;
+        pub const RODATA: usize = 312;
+        pub const GOFUNC: usize = 320;
+        pub const TEXTSECTMAP_PTR: usize = 328;
+        pub const TEXTSECTMAP_LEN: usize = 336;
+        pub const TEXTSECTMAP_CAP: usize = 344;
+    }
+
+    /// A structurally plausible 64-bit V5 moduledata: every sub-region of
+    /// `[types, etypes)` is in range and the segment pointers are real
+    /// addresses, so [`Moduledata::layout_self_consistent`] accepts it.
+    fn synthetic_v5() -> Vec<u8> {
+        let mut d = vec![0u8; 700];
+        put(&mut d, v5_off::TEXT, 0x401000);
+        put(&mut d, v5_off::ETEXT, 0x4a0000);
+        put(&mut d, v5_off::TYPES, 0x500000);
+        put(&mut d, v5_off::TYPEDESCLEN, 0x1000);
+        put(&mut d, v5_off::ETYPES, 0x520000);
+        put(&mut d, v5_off::ITABOFFSET, 0x1f000);
+        put(&mut d, v5_off::ITABSIZE, 0x400);
+        put(&mut d, v5_off::RODATA, 0x490000);
+        put(&mut d, v5_off::GOFUNC, 0x4f0000);
+        put(&mut d, v5_off::EPCLNTAB, 0x4ffff0);
+        d
+    }
+
+    /// A structurally plausible 64-bit V3 moduledata. The `textsectmap` slice
+    /// header at the position `epclntab` would occupy keeps the Go 1.26 probe
+    /// on the V3 side when the minor version is unknown.
+    fn synthetic_v3() -> Vec<u8> {
+        let mut d = vec![0u8; 700];
+        put(&mut d, v3_off::TEXT, 0x401000);
+        put(&mut d, v3_off::ETEXT, 0x4a0000);
+        put(&mut d, v3_off::TYPES, 0x4a2000);
+        put(&mut d, v3_off::ETYPES, 0x4d9000);
+        put(&mut d, v3_off::RODATA, 0x4a2000);
+        put(&mut d, v3_off::GOFUNC, 0x55c000);
+        put(&mut d, v3_off::TEXTSECTMAP_PTR, 0x400000);
+        put(&mut d, v3_off::TEXTSECTMAP_LEN, 1);
+        put(&mut d, v3_off::TEXTSECTMAP_CAP, 1);
+        d
+    }
+
     #[test]
     fn version_detection_go116() {
         // V2 moduledata needs enough space for the full prefix + version-specific section
         // Prefix: 1 ptr + 6 slices + 4 ptrs + 8 skipped ptrs = 1*8 + 6*24 + 4*8 + 8*8 = 248
         // V2 tail: 3 ptrs + 2 ptrs + 1 slice + 2 slices = 3*8 + 2*8 + 24 + 2*24 = 112
         let data = vec![0u8; 400];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go116, false, None);
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go116, None));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V2);
     }
@@ -833,7 +1048,7 @@ mod tests {
         // Go 1.18-1.19 (Go118 magic): rodata/gofunc present (V3), but no
         // covctrs. Distinct from the V2 (Go116) layout.
         let data = vec![0u8; 500];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go118, false, Some(19))
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go118, Some(19)))
             .expect("Go118 moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V3);
         assert!(md.rodata.is_some(), "Go 1.18+ has rodata");
@@ -843,7 +1058,7 @@ mod tests {
     #[test]
     fn version_detection_go116_is_v2_no_rodata() {
         let data = vec![0u8; 500];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go116, false, Some(16))
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go116, Some(16)))
             .expect("Go116 moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V2);
         assert!(md.rodata.is_none(), "Go 1.16-1.17 has no rodata");
@@ -852,7 +1067,7 @@ mod tests {
     #[test]
     fn version_detection_go120_minor_22() {
         let data = vec![0u8; 500];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go120, false, Some(22));
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(22)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V3);
     }
@@ -861,7 +1076,7 @@ mod tests {
     fn version_detection_go120_minor_25_is_v3_no_epclntab() {
         // Go 1.24 / 1.25 have NO epclntab field -> V3 layout, not V4.
         let data = vec![0u8; 500];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go120, false, Some(25));
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(25)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V3);
     }
@@ -870,7 +1085,7 @@ mod tests {
     fn version_detection_go120_minor_26_is_v4() {
         // epclntab was added in Go 1.26 -> V4.
         let data = vec![0u8; 500];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go120, false, Some(26));
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(26)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V4);
     }
@@ -878,32 +1093,123 @@ mod tests {
     #[test]
     fn version_detection_go120_minor_27_v5() {
         // minor > 26 and no typelink section -> V5 (Go 1.27+).
-        let mut data = vec![0u8; 600];
-        // itaboffset lands at byte 320 in the 64-bit V5 walk (see the V5
-        // branch comment for the field sequence). Plant a recognizable
-        // value to prove the new fields are actually read.
-        data[320..328].copy_from_slice(&0xdead_beefu64.to_le_bytes());
-        data[328..336].copy_from_slice(&0x40u64.to_le_bytes());
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go120, false, Some(27))
+        let data = synthetic_v5();
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(27)))
             .expect("V5 moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V5);
-        assert_eq!(md.itaboffset, Some(0xdead_beef));
-        assert_eq!(md.itabsize, Some(0x40));
+        assert_eq!(md.typedesclen, Some(0x1000));
+        assert_eq!(md.itaboffset, Some(0x1f000));
+        assert_eq!(md.itabsize, Some(0x400));
         assert!(md.typelinks.is_none());
         assert!(md.itablinks.is_none());
         // rodata/gofunc are still present in V5 (regression guard against
         // the old speculative branch that hardcoded them to None).
-        assert!(md.rodata.is_some());
-        assert!(md.gofunc.is_some());
+        assert_eq!(md.rodata, Some(0x490000));
+        assert_eq!(md.gofunc, Some(0x4f0000));
+        assert_eq!(md.epclntab, Some(0x4ffff0));
     }
 
     #[test]
     fn v4_falls_back_to_typelinks_not_v5() {
         // minor 27 but a typelink section is present -> stay on V4 layout.
         let data = vec![0u8; 600];
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go120, true, Some(27))
-            .expect("should parse");
+        let md = Moduledata::parse(
+            &data,
+            8,
+            LayoutHints {
+                pclntab_version: PclntabVersion::Go120,
+                go_minor: Some(27),
+                has_typelink_section: true,
+                has_go_type_section: false,
+            },
+        )
+        .expect("should parse");
         assert_eq!(md.version, ModuledataVersion::V4);
+    }
+
+    #[test]
+    fn pre_v5_layout_survives_a_missing_version_string() {
+        // Regression guard: PE binaries never carry a `.typelink` section, so
+        // for a version-scrubbed PE the only hint points at V5. Reading a
+        // pre-V5 moduledata with the V5 layout collapses the types span while
+        // leaving a huge `typedesclen`, which the consistency check rejects —
+        // so the parser must fall back to V3 rather than return the garbage.
+        let data = synthetic_v3();
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, None))
+            .expect("V3 moduledata should parse");
+        assert_eq!(md.version, ModuledataVersion::V3);
+        assert_eq!(md.types, 0x4a2000);
+        assert_eq!(md.etypes, 0x4d9000);
+        assert_eq!(md.rodata, Some(0x4a2000));
+        assert_eq!(md.gofunc, Some(0x55c000));
+        assert!(md.typedesclen.is_none());
+        assert!(md.itaboffset.is_none());
+    }
+
+    #[test]
+    fn v5_layout_wins_without_a_version_string() {
+        // The mirror case: a genuine V5 moduledata read as V3/V4 puts
+        // `typedesclen` where `etypes` belongs, leaving `etypes < types`. The
+        // consistency check rejects that, so V5 is chosen even though no
+        // version string is available.
+        let data = synthetic_v5();
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, None))
+            .expect("V5 moduledata should parse");
+        assert_eq!(md.version, ModuledataVersion::V5);
+        assert_eq!(md.itaboffset, Some(0x1f000));
+    }
+
+    #[test]
+    fn go_type_section_selects_v5_despite_a_stale_typelink_section() {
+        // `.go.type` only exists from Go 1.27, so it outranks the weak
+        // "a typelink section is present" signal.
+        let data = synthetic_v5();
+        let md = Moduledata::parse(
+            &data,
+            8,
+            LayoutHints {
+                pclntab_version: PclntabVersion::Go120,
+                go_minor: None,
+                has_typelink_section: true,
+                has_go_type_section: true,
+            },
+        )
+        .expect("V5 moduledata should parse");
+        assert_eq!(md.version, ModuledataVersion::V5);
+    }
+
+    #[test]
+    fn v5_is_never_chosen_below_the_go120_magic() {
+        // V5 requires covctrs, which the Go118 magic rules out — so even with
+        // every V5 hint set the layout must stay pre-V5.
+        let data = synthetic_v5();
+        let md = Moduledata::parse(
+            &data,
+            8,
+            LayoutHints {
+                pclntab_version: PclntabVersion::Go118,
+                go_minor: None,
+                has_typelink_section: false,
+                has_go_type_section: true,
+            },
+        )
+        .expect("should parse");
+        assert_ne!(md.version, ModuledataVersion::V5);
+    }
+
+    #[test]
+    fn inconsistent_layouts_fall_back_to_the_preferred_hint() {
+        // When neither candidate validates (truncated / garbage tail), the
+        // hint-preferred layout is returned so callers still get the head
+        // fields rather than nothing at all.
+        let mut data = synthetic_v5();
+        // Break both layouts: types above etypes with a nonsensical span.
+        put(&mut data, v5_off::TYPES, 0x900000);
+        put(&mut data, v5_off::ETYPES, 0x100000);
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(27)))
+            .expect("should still parse");
+        assert_eq!(md.version, ModuledataVersion::V5);
+        assert_eq!(md.minpc, 0);
     }
 
     #[test]
@@ -912,9 +1218,6 @@ mod tests {
         // ftab/filetab/findfunctab/minpc/maxpc, text/etext, four data ranges,
         // end/gcdata/gcbss, types/etypes. The tail is read best-effort.
         let mut data = vec![0u8; 512];
-        let put = |d: &mut [u8], off: usize, v: u64| {
-            d[off..off + 8].copy_from_slice(&v.to_le_bytes());
-        };
         // pclntable slice @0 (ptr, len, cap).
         put(&mut data, 0, 0x5000);
         put(&mut data, 8, 0x100);
@@ -926,7 +1229,7 @@ mod tests {
         put(&mut data, 200, 0x9000); // types
         put(&mut data, 208, 0xa000); // etypes
 
-        let md = Moduledata::parse(&data, 8, PclntabVersion::Go12, false, Some(10))
+        let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go12, Some(10)))
             .expect("legacy moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V1);
         assert_eq!(md.pclntable.ptr, 0x5000);
@@ -945,6 +1248,6 @@ mod tests {
     #[test]
     fn too_short_returns_none() {
         let data = vec![0u8; 10];
-        assert!(Moduledata::parse(&data, 8, PclntabVersion::Go120, false, Some(25)).is_none());
+        assert!(Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(25))).is_none());
     }
 }

@@ -5,6 +5,118 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+Go 1.27 verified against the released toolchain, plus a performance pass.
+Layouts were checked field-by-field against the `go1.27.1` and `go1.26.8`
+source trees: the V5 moduledata support from 0.3.0 is **correct as released**,
+so what needed fixing was the code paths it shares with older versions.
+
+### Fixed
+
+- **The V5 layout could be chosen for a pre-1.27 binary, silently emptying it.**
+  It was selected from a *negative* signal — no `.typelink` section — which PE
+  never has at any version, nor wasm, nor RELRO ELF. With no version string to
+  disagree, a Go 1.20-1.26 binary decoded as V5 and every field past `types`
+  shifted: on a version-scrubbed `basic_go124_windows_amd64.exe`, types went
+  494 → 0, itabs 16 → 0, init tasks 17 → 0 and `has_main` true → false, with no
+  error raised. `Moduledata::parse` now parses both candidate layouts and keeps
+  the one that is internally self-consistent (`layout_self_consistent`).
+- **`abi.MapType` was read with the Go 1.27 layout on every Go version.** The
+  map descriptor has changed shape six times and had its flag bits renumbered
+  once more; gobin implemented one. On Go ≤ 1.26 it over-read the record (24
+  bytes on 1.24-1.26, 48 on 1.14-1.23), so every `TypeDetail::Map` field past
+  `Hasher` was garbage, and `descriptor_size` mislocated the trailing
+  `UncommonType`. `MapLayout` now models all six eras, selected from the Go
+  version or — when scrubbed — from the moduledata version and pclntab magic,
+  with a structural probe for the one window those cannot separate.
+  `MapFlags` normalizes the three flag encodings.
+- **`text_va()` returned `Some(0)` on Go 1.26+ without a moduledata.** Go 1.26
+  stopped writing `textStart` into the pcHeader but left the slot, so every
+  `entry_va` collapsed to a raw `entry_off`. Zero now reads as absent, and the
+  executable section base is used as a real fallback.
+- **The Go 1.27 type walk ran past its bound**, using `etypes` where
+  `runtime.moduleTypelinks` uses `types + typedesclen` — a field that was
+  parsed but never read. Past the bound it surfaced unnamed junk types.
+- **One unparseable record ended the whole descriptor walk**, which on Go 1.27
+  is the only type-enumeration strategy there is. It now skips and continues
+  under a bounded budget. `itab_stride` likewise stops rather than guessing a
+  method count, which desynchronized the inline itab walk.
+- **`internal/runtime/*` was not classified as runtime code**, so half the
+  runtime of a Go 1.24+ binary read as ordinary internal library code.
+
+### Added
+
+- `.go.type` / `.go.func` (`__go_type` / `__go_func`) section recognition. Go
+  1.27 replaced `.typelink` / `.itablink` with these; their presence is a
+  positive V5 signal and a Go detection marker
+  (`ConfidenceSignal::TypeSectionPresent`).
+- RELRO section names: `-buildmode=pie` / `c-shared` / `c-archive` prefix these
+  with `.data.rel.ro`, which the classifier now strips. Previously every PIE
+  binary looked like it had no type sections.
+- `TFLAG_GC_MASK_ON_DEMAND` / `TFLAG_DIRECT_IFACE` / `TFLAG_REGULAR_MEMORY`
+  with matching `AbiType` accessors. Go 1.27 deleted type-level GC programs and
+  dropped `abi.MaxPtrmaskBytes` from 2048 to 16, so `Type.GCData` now usually
+  addresses an empty BSS slot rather than a bitmap; `gc_mask_va` reports those
+  as absent.
+- `benches/extract.rs`, a `divan` suite over the fixture corpus with allocation
+  profiling and stage-level benches (`stage_context`, `stage_buildinfo`,
+  `stage_pclntab`).
+
+### Changed — breaking
+
+- `Moduledata::parse` takes a `LayoutHints` struct instead of a
+  `(PclntabVersion, bool, Option<u32>)` tail.
+- `types::extract_types_iter` takes the `&Moduledata` and a `TypeAbi` bundle
+  instead of re-deriving both; `type_at_va` and `extract_all_types` follow.
+- `TypeDetail::Map` carries `key_va` / `elem_va` / `group_va` plus a boxed
+  `MapTypeExtra` tagged with the `MapLayout` it was read under. Fields a layout
+  does not record are `None` rather than `0`. `GoType` shrank 392 → 176 bytes.
+- `GoSections` gained `go_type`, `go_func`, `noptrdata`, `data_section` and
+  `text_section`.
+- moduledata discovery moved to `structures::locate::ModuledataLocator`,
+  replacing three near-identical scan loops.
+
+### Performance
+
+Extraction is 47-74% faster and allocates about a fifth as much. `full_sweep`
+(parse plus functions, types, itabs, strings, init order and embeds):
+
+| Fixture         | Before   | After   |      | Allocations | Bytes             |
+|-----------------|----------|---------|------|-------------|-------------------|
+| ELF 1.26        | 4.80 ms  | 2.56 ms | −47% | 725 → 320   | 416 KB → 49 KB    |
+| ELF 1.27        | 4.73 ms  | 2.53 ms | −47% | 1035 → 292  | 594 KB → 44 KB    |
+| Mach-O stripped | 3.98 ms  | 1.90 ms | −52% | 1126 → 297  | 595 KB → 48 KB    |
+| PE 1.27         | 10.42 ms | 3.11 ms | −70% | 1176 → 334  | 630 KB → 48 KB    |
+| wasm 1.27       | 11.99 ms | 3.18 ms | −74% | 961 → 262   | 1.70 MB → 1.28 MB |
+
+- The build-info magic scan walked the image twice, the "aligned" pass one byte
+  at a time. Now one sweep, narrowed first to the regions that can hold a
+  `SBUILDINFO` symbol: PE `parse` 4.10 ms → **160 µs**, wasm → 1.52 ms.
+- `types()` / `all_types()` / `type_at()` re-ran moduledata discovery — scan
+  included — on every call; they now reuse the parsed one: **−88% PE, −90% wasm**.
+- `init_order()` indexed all ~1800 functions to resolve a dozen init PCs:
+  **1.12 ms → 22 µs, 206 KB → 2.1 KB**.
+- `embedded_assets()` allocated two `String`s per candidate entry for a
+  compare-only sort key, re-read each word three times, and swept the
+  executable section and pclntab: **2.12 ms → 361 µs, 401 allocations → 5**.
+- `find_bytes` searches eight bytes at a time (SWAR), backing the build-ID,
+  build-info and heuristic scans; the moduledata scan compares words, not
+  slices.
+
+### Test corpus
+
+- `go127` fixtures rebuilt with **released go1.27.1**; `build.sh` no longer
+  special-cases them via `gotip`. `go127` gained the variants it lacked against
+  the `go126` anchor (`embed`, `cgo`, `minimal`, `_cover`, `_fips`, stripped),
+  so those surfaces run against a V5 moduledata for the first time.
+- New `go111` / `go112` / `go113` / `go123` fixtures complete the `abi.MapType`
+  coverage; the sweep asserts all six eras are present.
+- New `basic_go127_linux_amd64_pie` (RELRO names),
+  `basic_go124_windows_amd64_noversion.exe` (scrubbed version) and
+  `embed_go127_wasip1_wasm` (the one case where the address-space view is not
+  the file) cover the inputs that exposed the bugs above.
+
 ## [0.4.1]
 
 ### Fixed

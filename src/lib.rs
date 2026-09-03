@@ -91,7 +91,8 @@ use crate::{
         Arch, PclntabVersion, buildid, buildinfo, embed, gcprog,
         goslice::{GoSlice, GoStr},
         inittask, inline, itab,
-        moduledata::{ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect},
+        locate::ModuledataLocator,
+        moduledata::{LayoutHints, ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect},
         name::decode_name,
         pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
         strings as gostrings, types,
@@ -178,6 +179,20 @@ impl<'a> GoBinary<'a> {
         if sections.has_go_buildid_note {
             report.push(ConfidenceSignal::BuildidNotePresent);
             report.raise_to(Confidence::High);
+        }
+        // Type-metadata sections. `.typelink` / `.itablink` are the Go ≤1.26
+        // spelling; Go 1.27 replaced both with `.go.type` / `.go.func`. All
+        // four names are Go-linker-specific, so each is structural proof.
+        for (present, section) in [
+            (sections.typelink.is_some(), ".typelink"),
+            (sections.itablink.is_some(), ".itablink"),
+            (sections.go_type.is_some(), ".go.type"),
+            (sections.go_func.is_some(), ".go.func"),
+        ] {
+            if present {
+                report.push(ConfidenceSignal::TypeSectionPresent { section });
+                report.raise_to(Confidence::High);
+            }
         }
 
         let build_id = buildid::extract(&ctx);
@@ -400,9 +415,8 @@ impl<'a> GoBinary<'a> {
     fn parse_moduledata_at(&self, va: u64) -> Option<Moduledata> {
         let meta = self.pclntab_meta?;
         let bytes = self.ctx.slice_at_va(va)?;
-        let has_typelink = self.ctx.sections().typelink.is_some();
-        let go_minor = self.go_version.and_then(parse_go_minor_version);
-        Moduledata::parse(bytes, meta.ptr_size, meta.version, has_typelink, go_minor)
+        let hints = layout_hints(&self.ctx, meta.version, self.go_version);
+        Moduledata::parse(bytes, meta.ptr_size, hints)
     }
 
     /// Virtual address of `runtime.text` — the first byte of Go-emitted code.
@@ -411,16 +425,47 @@ impl<'a> GoBinary<'a> {
     /// In most cases callers should reach for [`Self::entry_va`] /
     /// [`Self::entry_rva`] instead, which fold both the `text_va` lookup and
     /// the (PE-only) image-base translation into one accessor.
+    ///
+    /// # Fallbacks
+    ///
+    /// Legacy (Go 1.2-1.15) binaries are parsed without a moduledata, and a
+    /// heavily-stripped modern binary may also lack one, so three sources are
+    /// tried in decreasing order of authority:
+    ///
+    /// 1. `moduledata.text`.
+    /// 2. The pclntab's own record of `runtime.text` — the pcHeader
+    ///    `textStart` field on Go 1.18-1.25, or the lowest absolute function
+    ///    PC on Go 1.2-1.17 (both surface as `header_text_start` /
+    ///    `text_start`).
+    /// 3. The base of the executable text section. Go 1.26 stopped writing
+    ///    `textStart` into the pcHeader, which leaves a moduledata-less 1.26+
+    ///    binary with no recorded value at all; the Go linker places
+    ///    `runtime.text` at the start of `.text` / `__text` on every format,
+    ///    so the section header supplies it.
+    ///
+    /// Returns `None` rather than `0` when nothing is available — a bogus
+    /// `Some(0)` would silently turn every [`Self::entry_va`] into a raw
+    /// `entry_off`.
     pub fn text_va(&self) -> Option<u64> {
         if let Some(m) = self.moduledata.as_ref() {
             return Some(m.text);
         }
-        // Legacy (Go 1.2-1.15) binaries are parsed without a moduledata, and
-        // stripped modern binaries may also lack one. The pclntab records
-        // `runtime.text` directly: for Go 1.2-1.15 it is the first function's
-        // absolute PC, and for Go 1.18+ it is the pcHeader `textStart` field
-        // (both surface as `header_text_start`).
-        self.pclntab().and_then(|p| p.header_text_start)
+        if let Some(pcl) = self.pclntab() {
+            if let Some(va) = pcl.header_text_start {
+                return Some(va);
+            }
+            // Go 1.16-1.17 store absolute PCs in the functab; the parser keeps
+            // the lowest one here to rebase `entry_off`, which makes it
+            // `runtime.text`.
+            if pcl.text_start != 0 {
+                return Some(pcl.text_start);
+            }
+        }
+        self.ctx
+            .sections()
+            .text_section
+            .map(|s| s.va)
+            .filter(|&va| va != 0)
     }
 
     /// Binary-level virtual address of a function's entry point.
@@ -854,18 +899,51 @@ impl<'a> GoBinary<'a> {
             return Vec::new();
         }
 
-        // One pass over the function table to map entry-offset -> name, so each
-        // init PC resolves without an O(nfunc) rescan per function.
+        // Resolve the init PCs to names with one pass over the function table.
+        //
+        // A binary has thousands of functions and a couple of dozen init
+        // tasks, so the pass collects only the entry offsets the tasks
+        // actually reference — indexing every function into a map costs more
+        // memory than the whole rest of this call and throws almost all of it
+        // away. It also walks `func_entries` rather than `functions()`, which
+        // would additionally decode a source file, line range and frame size
+        // for every function in the binary.
         let text_va = self.text_va();
-        let mut names: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
-        for f in self.functions() {
-            names.entry(f.entry_offset).or_insert(f.name);
+        let entry_off_of =
+            |pc_va: u64| -> Option<u32> { u32::try_from(pc_va.checked_sub(text_va?)?).ok() };
+
+        let mut wanted: Vec<u32> = raw
+            .iter()
+            .flatten()
+            .filter_map(|pc| entry_off_of(*pc))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut names: Vec<(u32, &str)> = Vec::with_capacity(wanted.len());
+        if !wanted.is_empty()
+            && let Some(pcl) = self.pclntab()
+        {
+            for (entry_off, func_off) in pcl.func_entries() {
+                if wanted.binary_search(&entry_off).is_err() {
+                    continue;
+                }
+                if let Some(func) = pcl.parse_func(func_off)
+                    && let Some(name) = pcl.func_name(func.name_off as u32)
+                {
+                    names.push((entry_off, name));
+                }
+            }
+            names.sort_unstable_by_key(|(off, _)| *off);
         }
 
         let resolve = |pc_va: u64| -> Option<&str> {
-            let off = pc_va.checked_sub(text_va?)?;
-            let off = u32::try_from(off).ok()?;
-            names.get(&off).copied()
+            let off = entry_off_of(pc_va)?;
+            names
+                .binary_search_by_key(&off, |(o, _)| *o)
+                .ok()
+                .and_then(|i| names.get(i))
+                .map(|(_, n)| *n)
         };
 
         raw.into_iter()
@@ -946,18 +1024,10 @@ impl<'a> GoBinary<'a> {
     /// Collect with `bin.types().collect::<Vec<_>>()` if you need an owned
     /// container.
     pub fn types(&self) -> types::TypeIter<'_> {
-        let meta = match self.pclntab_meta {
-            Some(m) => m,
-            None => return types::extract_types_iter(&self.ctx, 0, None, None, None),
+        let (Some(meta), Some(md)) = (self.pclntab_meta, self.moduledata.as_ref()) else {
+            return types::TypeIter::empty(&self.ctx);
         };
-        let go_version_minor = self.go_version().and_then(parse_go_minor_version);
-        types::extract_types_iter(
-            &self.ctx,
-            meta.ptr_size,
-            Some(meta.version),
-            Some(meta.offset),
-            go_version_minor,
-        )
+        types::extract_types_iter(&self.ctx, md, self.type_abi(meta))
     }
 
     /// Parse the type descriptor at a specific virtual address into a
@@ -970,13 +1040,7 @@ impl<'a> GoBinary<'a> {
     pub fn type_at(&self, va: u64) -> Option<types::GoType<'_>> {
         let meta = self.pclntab_meta?;
         let types_base = self.moduledata.as_ref()?.types;
-        types::type_at_va(
-            &self.ctx,
-            va,
-            types_base,
-            meta.ptr_size,
-            self.legacy_names(),
-        )
+        types::type_at_va(&self.ctx, va, types_base, self.type_abi(meta))
     }
 
     /// Enumerate **every** reachable type descriptor, not just the
@@ -1000,12 +1064,31 @@ impl<'a> GoBinary<'a> {
         };
         types::extract_all_types(
             &self.ctx,
-            meta.ptr_size,
             self.types().collect(),
             types_base,
             etypes,
-            self.legacy_names(),
+            self.type_abi(meta),
         )
+    }
+
+    /// The per-binary constants every type-descriptor read depends on.
+    ///
+    /// The `abi.MapType` layout is the one that needs deriving: the map
+    /// descriptor changed shape six times between Go 1.7 and 1.27, and its size
+    /// feeds the position of every map type's `UncommonType`, so it has to be
+    /// settled before any descriptor is read. See [`types::MapLayout::infer`].
+    fn type_abi(&self, meta: PclntabMeta) -> types::TypeAbi {
+        let md_version = self.moduledata.as_ref().map(|m| m.version);
+        types::TypeAbi {
+            ps: meta.ptr_size,
+            legacy_names: self.legacy_names(),
+            map_layout: types::MapLayout::infer(
+                self.go_version().and_then(parse_go_minor_version),
+                meta.version == PclntabVersion::Go120,
+                md_version == Some(ModuledataVersion::V5),
+                md_version == Some(ModuledataVersion::V4),
+            ),
+        }
     }
 
     /// Streaming iterator over Go string literals discovered by scanning the
@@ -1198,196 +1281,32 @@ fn parse_go_minor_version(version: &str) -> Option<u32> {
 /// Locate and parse the moduledata for accessor-only use (text/etext/types
 /// region addresses).
 ///
-/// Prefer the dedicated `.go.module` section (Go 1.26+); otherwise scan for
-/// moduledata via its pcHeader pointer (PE, and ELF / Mach-O before Go 1.26).
-/// Returns `None` if the binary lacks VA mappings or moduledata can't be
-/// located — callers degrade gracefully (the affected accessors return `None`).
+/// Delegates to [`ModuledataLocator`], which owns every discovery strategy —
+/// the `.go.module` section on Go 1.26+ ELF / Mach-O, and the `pcHeader`-
+/// pointer scan everywhere else. Returns `None` if the binary lacks VA
+/// mappings or the moduledata cannot be located; callers degrade gracefully
+/// (the affected accessors return `None`).
 fn find_moduledata(
     ctx: &BinaryContext<'_>,
     pclntab: &ParsedPclntab<'_>,
     go_version: Option<&str>,
 ) -> Option<Moduledata> {
-    if !ctx.has_va_mapping() {
-        return None;
-    }
+    let hints = layout_hints(ctx, pclntab.version, go_version);
+    ModuledataLocator::new(ctx, pclntab.ptr_size, pclntab.offset, hints).locate()
+}
 
-    // Read through the address-space view so chained-fixup pointers (Mach-O
-    // plugins / CGO) are already rebased to real VAs.
-    let data = ctx.structure_search_data();
+/// Collect the out-of-band signals [`Moduledata::parse`] uses to pick between
+/// the V5 (Go 1.27+) and pre-V5 moduledata layouts.
+fn layout_hints(
+    ctx: &BinaryContext<'_>,
+    pclntab_version: PclntabVersion,
+    go_version: Option<&str>,
+) -> LayoutHints {
     let sections = ctx.sections();
-    let go_minor = go_version.and_then(parse_go_minor_version);
-    let has_typelink = sections.typelink.is_some();
-
-    if let Some(ref range) = sections.go_module {
-        let end = range.offset.checked_add(range.size)?;
-        let md_data = data.get(range.offset..end)?;
-        return Moduledata::parse(
-            md_data,
-            pclntab.ptr_size,
-            pclntab.version,
-            has_typelink,
-            go_minor,
-        );
+    LayoutHints {
+        pclntab_version,
+        go_minor: go_version.and_then(parse_go_minor_version),
+        has_typelink_section: sections.typelink.is_some(),
+        has_go_type_section: sections.go_type.is_some(),
     }
-
-    if ctx.format() == BinaryFormat::Wasm {
-        return find_moduledata_wasm(ctx, pclntab, has_typelink, go_minor);
-    }
-
-    // No dedicated `.go.module` section. That section was added in Go 1.26, so
-    // older ELF / Mach-O binaries (and every PE) keep moduledata in
-    // `.noptrdata` with no name — locate it by scanning for its pcHeader
-    // pointer.
-    find_moduledata_by_scan(ctx, pclntab, has_typelink, go_minor)
-}
-
-/// Wasm moduledata discovery: scan the linear-memory image for a
-/// pointer-aligned `u64` equal to the pcHeader's linear-memory address, then
-/// validate by parsing.
-///
-/// For wasm, [`ParsedPclntab::offset`] is already a linear-memory address
-/// (the parser ran on the reconstructed linear-memory image, not on file
-/// bytes), so no `file_to_va` translation is needed.
-fn find_moduledata_wasm(
-    ctx: &BinaryContext<'_>,
-    pclntab: &ParsedPclntab<'_>,
-    has_typelink: bool,
-    go_minor: Option<u32>,
-) -> Option<Moduledata> {
-    let lm = ctx.structure_search_data();
-    let ps = pclntab.ptr_size as usize;
-    if ps == 0 {
-        return None;
-    }
-    let pclntab_va = pclntab.offset as u64;
-    let target_bytes: Vec<u8> = match pclntab.ptr_size {
-        4 => (pclntab_va as u32).to_le_bytes().to_vec(),
-        8 => pclntab_va.to_le_bytes().to_vec(),
-        _ => return None,
-    };
-
-    let mut offset: usize = 0;
-    while let Some(end) = offset.checked_add(ps) {
-        if end > lm.len() {
-            break;
-        }
-        let rem = offset.checked_rem(ps).unwrap_or(0);
-        if rem != 0 {
-            let bump = ps.saturating_sub(rem);
-            offset = match offset.checked_add(bump) {
-                Some(o) => o,
-                None => break,
-            };
-            continue;
-        }
-        let window = match lm.get(offset..end) {
-            Some(w) => w,
-            None => break,
-        };
-        if window == target_bytes.as_slice() {
-            let remaining = match lm.get(offset..) {
-                Some(r) => r,
-                None => break,
-            };
-            if let Some(md) = Moduledata::parse(
-                remaining,
-                pclntab.ptr_size,
-                pclntab.version,
-                has_typelink,
-                go_minor,
-            ) && md.minpc < md.maxpc
-                && md.types != 0
-            {
-                return Some(md);
-            }
-        }
-        offset = match offset.checked_add(ps) {
-            Some(o) => o,
-            None => break,
-        };
-    }
-    None
-}
-
-/// Validate a scanned moduledata candidate, accounting for the legacy layout.
-///
-/// The modern check requires a non-zero `types` base and a `funcnametab`
-/// pointer that maps into the file. The legacy (Go 1.5-1.15) layout has neither
-/// `funcnametab` nor — before Go 1.7 — a `types` base, so it is validated
-/// through its always-present `text` boundary instead. `minpc < maxpc` guards
-/// both.
-fn moduledata_scan_valid(ctx: &BinaryContext<'_>, md: &Moduledata) -> bool {
-    if md.minpc >= md.maxpc {
-        return false;
-    }
-    match md.version {
-        ModuledataVersion::V1 => md.text != 0 && ctx.va_to_file(md.text).is_some(),
-        _ => md.types != 0 && ctx.va_to_file(md.funcnametab.ptr).is_some(),
-    }
-}
-
-/// Section-less moduledata discovery (PE, and ELF / Mach-O before Go 1.26):
-/// scan file bytes for a pointer-aligned value matching the pclntab VA — the
-/// moduledata's first field is `pcHeader *pcHeader` — then validate by parsing.
-fn find_moduledata_by_scan(
-    ctx: &BinaryContext<'_>,
-    pclntab: &ParsedPclntab<'_>,
-    has_typelink: bool,
-    go_minor: Option<u32>,
-) -> Option<Moduledata> {
-    // The scan looks for the pcHeader pointer; on chained-fixup Mach-O it must
-    // run over the rebased view so the stored pointer matches the pclntab VA.
-    let data = ctx.structure_search_data();
-    let pclntab_va = ctx.file_to_va(pclntab.offset)?;
-    let ps = pclntab.ptr_size as usize;
-    if ps == 0 {
-        return None;
-    }
-
-    let target_bytes: Vec<u8> = match ps {
-        4 => (pclntab_va as u32).to_le_bytes().to_vec(),
-        8 => pclntab_va.to_le_bytes().to_vec(),
-        _ => return None,
-    };
-
-    let mut offset = 0usize;
-    while let Some(end) = offset.checked_add(ps) {
-        if end > data.len() {
-            break;
-        }
-        let rem = offset.checked_rem(ps).unwrap_or(0);
-        if rem != 0 {
-            let bump = ps.saturating_sub(rem);
-            offset = match offset.checked_add(bump) {
-                Some(o) => o,
-                None => break,
-            };
-            continue;
-        }
-        let window = match data.get(offset..end) {
-            Some(w) => w,
-            None => break,
-        };
-        if window == target_bytes.as_slice() {
-            let remaining = match data.get(offset..) {
-                Some(r) => r,
-                None => break,
-            };
-            if let Some(md) = Moduledata::parse(
-                remaining,
-                pclntab.ptr_size,
-                pclntab.version,
-                has_typelink,
-                go_minor,
-            ) && moduledata_scan_valid(ctx, &md)
-            {
-                return Some(md);
-            }
-        }
-        offset = match offset.checked_add(ps) {
-            Some(o) => o,
-            None => break,
-        };
-    }
-    None
 }

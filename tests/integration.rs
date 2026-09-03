@@ -52,6 +52,10 @@ const BASIC_EMBED: &str = "tests/samples/embed_go126_darwin_arm64";
 const BASIC_EMBED_STRIPPED: &str = "tests/samples/embed_go126_darwin_arm64_stripped";
 const BASIC_EMBED_LINUX: &str = "tests/samples/embed_go126_linux_amd64";
 const COVER_LINUX: &str = "tests/samples/basic_go126_linux_amd64_cover";
+const BASIC_GO127_LINUX: &str = "tests/samples/basic_go127_linux_amd64";
+const BASIC_GO127_PIE: &str = "tests/samples/basic_go127_linux_amd64_pie";
+const BASIC_GO124_WINDOWS: &str = "tests/samples/basic_go124_windows_amd64.exe";
+const BASIC_GO124_WINDOWS_NOVERSION: &str = "tests/samples/basic_go124_windows_amd64_noversion.exe";
 
 fn load(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
@@ -777,6 +781,101 @@ mod buildinfo {
 mod moduledata {
     use super::*;
 
+    /// A PE binary never carries a `.typelink` section at any Go version, so
+    /// with its version string scrubbed the only layout hint points at Go 1.27.
+    /// Picking V5 there shifts every field past `types` and silently reports an
+    /// empty types region, no itabs, no init tasks and `has_main == false`.
+    /// The layout must instead be arbitrated structurally, giving byte-for-byte
+    /// the same extraction as the intact binary.
+    #[test]
+    fn layout_survives_a_scrubbed_version_string() {
+        use gobin::structures::moduledata::ModuledataVersion;
+
+        let intact_data = load(BASIC_GO124_WINDOWS);
+        let intact = GoBinary::parse(&intact_data).unwrap();
+        let scrubbed_data = load(BASIC_GO124_WINDOWS_NOVERSION);
+        let scrubbed = GoBinary::parse(&scrubbed_data).unwrap();
+
+        // The premise: the version really is unrecoverable from the scrubbed
+        // copy, so the parser cannot fall back on it.
+        assert!(intact.go_version().unwrap().starts_with("go1.24"));
+        assert!(
+            !scrubbed
+                .go_version()
+                .is_some_and(|v| v.starts_with("go1.24")),
+            "fixture should have no usable version string"
+        );
+
+        let a = intact.moduledata().unwrap();
+        let b = scrubbed.moduledata().unwrap();
+        assert_eq!(b.version, ModuledataVersion::V3);
+        assert_eq!(a.version, b.version);
+        assert_eq!((a.types, a.etypes), (b.types, b.etypes));
+        assert_eq!(
+            (a.rodata, a.gofunc, a.epclntab),
+            (b.rodata, b.gofunc, b.epclntab)
+        );
+        assert_eq!(a.has_main, b.has_main);
+        assert!(a.has_main);
+
+        assert_eq!(intact.types().count(), scrubbed.types().count());
+        assert_eq!(intact.itab_pairs().count(), scrubbed.itab_pairs().count());
+        assert_eq!(intact.init_order().len(), scrubbed.init_order().len());
+        assert!(
+            scrubbed.types().count() > 100,
+            "types must not collapse to 0"
+        );
+        assert!(scrubbed.itab_pairs().count() > 0);
+        assert!(!scrubbed.init_order().is_empty());
+    }
+
+    /// `-buildmode=pie` renames every read-only-relocatable Go section with a
+    /// `.data.rel.ro` prefix. If the classifier does not strip it, a PIE binary
+    /// looks like it has no type sections at all — which for Go ≤1.26 is read
+    /// as a Go 1.27 signal, and for 1.27 loses the positive `.go.type` signal.
+    #[test]
+    fn pie_relro_section_names_are_recognized() {
+        use gobin::structures::moduledata::ModuledataVersion;
+
+        let plain_data = load(BASIC_GO127_LINUX);
+        let plain = GoBinary::parse(&plain_data).unwrap();
+        let pie_data = load(BASIC_GO127_PIE);
+        let pie = GoBinary::parse(&pie_data).unwrap();
+
+        assert!(
+            pie.context().sections().go_type.is_some(),
+            ".data.rel.ro.go.type must classify as .go.type"
+        );
+        assert!(pie.context().sections().go_func.is_some());
+        assert_eq!(pie.moduledata().unwrap().version, ModuledataVersion::V5);
+        // Same program, same toolchain: the extraction must not differ.
+        assert_eq!(plain.types().count(), pie.types().count());
+        assert_eq!(plain.itab_pairs().count(), pie.itab_pairs().count());
+        assert_eq!(plain.functions().count(), pie.functions().count());
+    }
+
+    /// Go 1.26 stopped writing `textStart` into the pcHeader, leaving the slot
+    /// zeroed. A moduledata-less 1.26+ binary must not report `runtime.text` as
+    /// address 0 — that turns every entry VA into a raw `entry_off` without any
+    /// error surfacing.
+    #[test]
+    fn text_va_is_never_zero() {
+        for f in super::matrix::discover() {
+            let data = load(&f.path);
+            let Some(bin) = GoBinary::parse(&data) else {
+                continue;
+            };
+            if let Some(va) = bin.text_va() {
+                // wasm addresses code in a separate PC space whose text base
+                // legitimately is 0; every other format maps text above 0.
+                if bin.context().format() == BinaryFormat::Wasm {
+                    continue;
+                }
+                assert_ne!(va, 0, "{}: text_va() reported address 0", f.path);
+            }
+        }
+    }
+
     #[test]
     fn moduledata_segments_and_identity() {
         let data = load(BASIC_LINUX);
@@ -1067,6 +1166,34 @@ mod moduledata {
 mod embed_and_fips {
     use super::*;
 
+    /// `embed.FS` recovery reads through the address-space view, which for
+    /// wasm is the reconstructed linear-memory image rather than the file.
+    /// Narrowing that search with file-offset section ranges finds nothing —
+    /// silently, since a binary with no embeds legitimately returns empty.
+    #[test]
+    fn embedded_assets_recovered_from_wasm() {
+        let data = load("tests/samples/embed_go127_wasip1_wasm");
+        let bin = GoBinary::parse(&data).unwrap();
+        let assets = bin.embedded_assets();
+        assert!(
+            !assets.is_empty(),
+            "wasm embed fixture must yield its embedded files"
+        );
+        assert!(
+            assets.iter().any(|a| a.path.ends_with(".txt")),
+            "expected the embedded text assets, got {:?}",
+            assets.iter().map(|a| a.path).collect::<Vec<_>>()
+        );
+        // Directories carry no bytes; files do.
+        for a in &assets {
+            if a.is_dir {
+                assert!(a.data.is_empty(), "{}: dir must have no bytes", a.path);
+            } else {
+                assert!(!a.data.is_empty(), "{}: file must have bytes", a.path);
+            }
+        }
+    }
+
     fn assert_embed_assets(path: &str) {
         let data = load(path);
         let bin = GoBinary::parse(&data).unwrap();
@@ -1277,6 +1404,229 @@ mod wasm {
 // ===========================================================================
 mod types {
     use super::*;
+
+    /// `abi.MapType` has shipped three different shapes — bucket-based `hmap`
+    /// (≤1.23), Swiss tables (1.24-1.26), and Swiss with explicit key/elem
+    /// strides (1.27+) — and each descriptor's size feeds the position of its
+    /// trailing `UncommonType`. Sweep the corpus and assert every map
+    /// descriptor is read with the layout its Go version actually emitted, with
+    /// the version-specific fields populated and the others genuinely absent.
+    #[test]
+    fn map_descriptors_use_the_layout_of_their_go_version() {
+        use gobin::structures::types::{MapLayout, TypeDetail};
+
+        let mut checked = 0usize;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for f in super::matrix::discover() {
+            let minor = super::matrix::tag_minor(&f.gotag);
+            // Type descriptors arrived in Go 1.7.
+            if minor < 7 {
+                continue;
+            }
+            let expected = MapLayout::for_go_minor(minor);
+            let data = load(&f.path);
+            let Some(bin) = GoBinary::parse(&data) else {
+                continue;
+            };
+            let mut saw_map = false;
+            for t in bin.types() {
+                let TypeDetail::Map { extra, .. } = &t.detail else {
+                    continue;
+                };
+                saw_map = true;
+                assert_eq!(
+                    extra.layout, expected,
+                    "{}: {} parsed with {:?}, expected {:?}",
+                    f.path, t.name, extra.layout, expected
+                );
+                match expected {
+                    MapLayout::HmapWithHmapType | MapLayout::HmapBools => {
+                        assert!(extra.bucket_size.is_some_and(|b| b > 0), "{}", f.path);
+                        assert!(extra.hasher.is_none(), "{}: hasher arrives in 1.14", f.path);
+                        assert!(
+                            extra.raw_flags.is_none(),
+                            "{}: the bool tail has no flags word",
+                            f.path
+                        );
+                        assert!(extra.group_size.is_none(), "{}", f.path);
+                        assert_eq!(
+                            extra.hmap.is_some(),
+                            expected == MapLayout::HmapWithHmapType,
+                            "{}: the hmap pointer exists only up to Go 1.10",
+                            f.path
+                        );
+                    }
+                    MapLayout::HmapFlags | MapLayout::HmapHasher => {
+                        assert!(extra.bucket_size.is_some_and(|b| b > 0), "{}", f.path);
+                        assert!(extra.raw_flags.is_some(), "{}", f.path);
+                        assert!(extra.hmap.is_none(), "{}", f.path);
+                        assert_eq!(
+                            extra.hasher.is_some(),
+                            expected == MapLayout::HmapHasher,
+                            "{}: the hasher pointer arrives in Go 1.14",
+                            f.path
+                        );
+                        assert!(extra.group_size.is_none(), "{}", f.path);
+                        assert!(extra.slot_size.is_none(), "{}", f.path);
+                        assert!(extra.key_stride.is_none(), "{}", f.path);
+                    }
+                    MapLayout::Swiss => {
+                        assert!(extra.group_size.is_some_and(|g| g > 0), "{}", f.path);
+                        assert!(extra.slot_size.is_some(), "{}", f.path);
+                        // The 1.27-only stride fields must read as absent,
+                        // not as a zero scavenged from the next descriptor.
+                        assert!(extra.keys_off.is_none(), "{}", f.path);
+                        assert!(extra.key_stride.is_none(), "{}", f.path);
+                        assert!(extra.bucket_size.is_none(), "{}", f.path);
+                    }
+                    MapLayout::SwissSplitGroup => {
+                        assert!(extra.group_size.is_some_and(|g| g > 0), "{}", f.path);
+                        assert!(extra.keys_off.is_some(), "{}", f.path);
+                        assert!(extra.key_stride.is_some(), "{}", f.path);
+                        assert!(extra.elem_stride.is_some(), "{}", f.path);
+                        assert!(extra.slot_size.is_none(), "{}", f.path);
+                        assert!(extra.bucket_size.is_none(), "{}", f.path);
+                    }
+                    MapLayout::Probe => unreachable!("resolved before parsing"),
+                }
+                // The flags word is a 5-bit mask in every encoding; a value
+                // outside that range means we read past the descriptor's end.
+                if let Some(raw) = extra.raw_flags {
+                    assert!(
+                        raw < 64,
+                        "{}: {} has implausible map flags {raw:#x}",
+                        f.path,
+                        t.name
+                    );
+                }
+                // `reflexive_key` exists in every hmap encoding and in none of
+                // the Swiss ones, which is a second, independent check that the
+                // right decoder ran.
+                assert_eq!(
+                    extra.flags.reflexive_key.is_some(),
+                    expected.is_hmap(),
+                    "{}: {} reflexive-key presence disagrees with {:?}",
+                    f.path,
+                    t.name,
+                    expected
+                );
+                seen.insert(format!("{expected:?}"));
+                checked += 1;
+            }
+            // Every fixture that reaches `fmt`/`reflect` carries map types.
+            if f.prog == "types" {
+                assert!(
+                    saw_map,
+                    "{}: types harness should surface map types",
+                    f.path
+                );
+            }
+        }
+        assert!(checked > 50, "expected a broad sweep, checked {checked}");
+        // Every layout era must be represented by a real fixture, so the
+        // corpus cannot silently lose coverage of one of the six boundaries.
+        let want: BTreeSet<String> = [
+            "HmapWithHmapType",
+            "HmapBools",
+            "HmapFlags",
+            "HmapHasher",
+            "Swiss",
+            "SwissSplitGroup",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            seen, want,
+            "map-layout coverage gap: the corpus exercises {seen:?}"
+        );
+    }
+
+    /// Go 1.27 replaced the typelink table with a walk bounded by
+    /// `moduledata.typedesclen`. Walking to `etypes` instead runs off the end
+    /// of the typelink descriptors into non-typelink types, `type:.namedata.*`
+    /// blobs, and finally the inline itab array — surfacing unnamed junk types.
+    #[test]
+    fn v5_type_walk_stops_at_typedesclen() {
+        use gobin::structures::moduledata::ModuledataVersion;
+
+        for f in super::matrix::discover() {
+            let data = load(&f.path);
+            let Some(bin) = GoBinary::parse(&data) else {
+                continue;
+            };
+            let Some(md) = bin.moduledata() else { continue };
+            if md.version != ModuledataVersion::V5 {
+                continue;
+            }
+            let typedesclen = md.typedesclen.expect("V5 records typedesclen");
+            let itaboffset = md.itaboffset.expect("V5 records itaboffset");
+            assert!(typedesclen > 0 && typedesclen <= itaboffset, "{}", f.path);
+            let bound = md.types + typedesclen;
+
+            let types: Vec<_> = bin.types().collect();
+            assert!(!types.is_empty(), "{}: V5 must still yield types", f.path);
+            for t in &types {
+                assert!(
+                    t.descriptor_va >= md.types && t.descriptor_va < bound,
+                    "{}: type {:?} at {:#x} lies outside [types, types+typedesclen) = [{:#x}, {:#x})",
+                    f.path,
+                    t.name,
+                    t.descriptor_va,
+                    md.types,
+                    bound
+                );
+                assert!(
+                    !t.name.is_empty(),
+                    "{}: unnamed type at {:#x} — the walk over-ran its bound",
+                    f.path,
+                    t.descriptor_va
+                );
+            }
+        }
+    }
+
+    /// Go 1.27 lowered `abi.MaxPtrmaskBytes` from 2048 to 16 and deleted
+    /// type-level GC programs, so most non-trivial types now defer their
+    /// pointer mask to run time. `gc_mask_va` must report those as absent
+    /// rather than handing back the address of an empty BSS slot.
+    #[test]
+    fn gc_mask_on_demand_is_modelled() {
+        use gobin::structures::abitype::AbiType;
+
+        let data = load(BASIC_GO127_LINUX);
+        let bin = GoBinary::parse(&data).unwrap();
+        let mut on_demand = 0usize;
+        let mut inline_mask = 0usize;
+        for t in bin.types() {
+            let Some(off) = bin.context().va_to_file(t.descriptor_va) else {
+                continue;
+            };
+            let Some(abi) = bin
+                .context()
+                .structure_search_data()
+                .get(off..)
+                .and_then(|d| AbiType::parse(d, 8))
+            else {
+                continue;
+            };
+            if abi.gc_mask_on_demand() {
+                on_demand += 1;
+                assert!(
+                    abi.gc_mask_va().is_none(),
+                    "on-demand types have no static mask"
+                );
+            } else if abi.gcdata != 0 {
+                inline_mask += 1;
+                assert_eq!(abi.gc_mask_va(), Some(abi.gcdata));
+            }
+        }
+        assert!(inline_mask > 0, "small types still carry a static mask");
+        // Whether any type in a given program crosses the (Go 1.27) 16-byte
+        // threshold depends on the program, so `on_demand` is only required to
+        // be consistent, not non-zero.
+        let _ = on_demand;
+    }
 
     #[test]
     fn type_details_present() {
@@ -1652,6 +2002,16 @@ mod types {
         // runtime.* / runtime/internal/* are runtime AND internal, never stdlib
         assert!(is_runtime_path("runtime"));
         assert!(is_runtime_path("runtime/internal/atomic"));
+        // Go 1.24 moved the runtime's internal packages under `internal/`;
+        // they are still runtime code, not ordinary internal library code.
+        assert!(is_runtime_path("internal/runtime/atomic"));
+        assert!(is_runtime_path("internal/runtime/maps"));
+        assert!(is_runtime_path("internal/runtime/sys"));
+        assert!(is_internal_path("internal/runtime/maps"));
+        assert!(!is_stdlib_path("internal/runtime/maps"));
+        // …but a non-runtime `internal/` package is not runtime.
+        assert!(!is_runtime_path("internal/abi"));
+        assert!(!is_runtime_path("internal/runtimefoo"));
         assert!(is_internal_path("runtime"));
         assert!(!is_stdlib_path("runtime"));
 
@@ -1772,7 +2132,7 @@ mod types {
 
     #[test]
     fn enum_display_strings_are_stable() {
-        use gobin::structures::types::TypeDetail;
+        use gobin::structures::types::{MapLayout, MapTypeExtra, TypeDetail};
 
         // Confidence
         assert_eq!(format!("{}", Confidence::None), "none");
@@ -1817,10 +2177,9 @@ mod types {
                 key_va: 0x1,
                 elem_va: 0x2,
                 group_va: 0,
-                hasher_va: 0,
-                key_stride: 0,
-                elem_stride: 0,
-                flags: 0,
+                extra: Box::new(
+                    MapTypeExtra::parse(&[0u8; 88], 8, MapLayout::SwissSplitGroup).unwrap(),
+                ),
             }
             .kind_str(),
             "map"
@@ -1930,17 +2289,17 @@ mod matrix {
         structures::{Arch, PclntabVersion, moduledata::ModuledataVersion},
     };
 
-    struct Fixture {
-        path: String,
-        prog: String,
-        gotag: String,
-        goos: String,
-        goarch: String,
+    pub struct Fixture {
+        pub path: String,
+        pub prog: String,
+        pub gotag: String,
+        pub goos: String,
+        pub goarch: String,
     }
 
     /// Discover every fixture binary, parsing its
     /// `<prog>_go<NN>_<goos>_<goarch>[_variant]` filename.
-    fn discover() -> Vec<Fixture> {
+    pub fn discover() -> Vec<Fixture> {
         let dir = "tests/samples";
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -1954,9 +2313,16 @@ mod matrix {
                 continue;
             }
             let name = fname.strip_suffix(".exe").unwrap_or(&fname);
-            // Peel an optional build variant (stripped / cover / fips) to expose
-            // the underlying <prog>_go<NN>_<goos>_<goarch> name.
-            let core = ["_stripped", "_cover", "_fips"]
+            // `_noversion` fixtures have their Go version string deliberately
+            // scrubbed, so the version-derived assertions below do not apply.
+            // They are exercised by `moduledata::layout_survives_a_scrubbed_
+            // version_string` instead.
+            if name.ends_with("_noversion") {
+                continue;
+            }
+            // Peel an optional build variant (stripped / cover / fips / pie) to
+            // expose the underlying <prog>_go<NN>_<goos>_<goarch> name.
+            let core = ["_stripped", "_cover", "_fips", "_pie"]
                 .iter()
                 .find_map(|v| name.strip_suffix(v))
                 .unwrap_or(name);
@@ -1979,7 +2345,7 @@ mod matrix {
 
     /// Minor version from a `go1<minor>` tag (`go17` → 7, `go126` → 26). Every
     /// Go release is 1.x, so stripping `go1` is unambiguous.
-    fn tag_minor(gotag: &str) -> u32 {
+    pub fn tag_minor(gotag: &str) -> u32 {
         gotag
             .strip_prefix("go1")
             .and_then(|s| s.parse().ok())

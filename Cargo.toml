@@ -1,6 +1,6 @@
 [package]
 name = "gobin"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Static analysis library for Go compiled binaries - identification and metadata extraction"
@@ -44,3 +44,8 @@ goblin = { version = "0.10.7", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "extract"
+harness = false
