@@ -8,6 +8,10 @@
 //! - [`buildinfo`] -- Version, module path, dependencies, and build settings
 //! - [`pclntab`] -- The PC/line table: function names, source files, line numbers
 //!
+//! [`moduledata`] parses the linker-generated master record that ties the rest
+//! together, and [`locate`] finds it — by section where the toolchain emits
+//! one, and by scanning for its `pcHeader` pointer everywhere else.
+//!
 //! ## Why These Structures Exist
 //!
 //! The Go runtime is more self-aware than a typical C runtime. It needs metadata for:
@@ -40,6 +44,7 @@ pub mod inline;
 pub mod interfacetype;
 pub mod itab;
 pub mod kind;
+pub mod locate;
 pub mod maptype;
 pub mod method;
 pub mod moduledata;

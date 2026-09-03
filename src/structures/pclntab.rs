@@ -42,7 +42,8 @@
 //! 7           1           ptrSize          Pointer size (4/8)
 //! 8           ptrSize     nfunc            Number of functions
 //! 8+1*ps      ptrSize     nfiles           Number of source files
-//! 8+2*ps      ptrSize     (unused)         Formerly textStart (Go 1.18+)
+//! 8+2*ps      ptrSize     textStart        `runtime.text` VA; Go 1.18-1.25 only
+//!                                          (Go 1.26+ leaves the slot zeroed)
 //! 8+3*ps      ptrSize     funcnameOffset   Offset to funcnametab
 //! 8+4*ps      ptrSize     cuOffset         Offset to cutab
 //! 8+5*ps      ptrSize     filetabOffset    Offset to filetab
@@ -179,8 +180,15 @@ pub struct ParsedPclntab<'a> {
     /// it so `FuncData::entry_off` is a relative offset for every version.
     pub text_start: u64,
     /// The pcHeader's `textStart` field (the `runtime.text` VA), added to the
-    /// header in Go 1.18. `None` for Go 1.16-1.17, which lack the field.
-    /// Mirrors `moduledata.text`.
+    /// header in Go 1.18 and **retired in Go 1.26**, which left the slot in
+    /// place but stopped writing it because storing it required a relocation
+    /// (`runtime/symtab.go`: *"The next field used to be textStart. This is no
+    /// longer stored… Code should use the moduledata text field instead."*).
+    ///
+    /// `None` for Go 1.16-1.17, which lack the field, and for Go 1.26+, where
+    /// the slot reads as zero — a zero is reported as absent rather than as
+    /// address `0`, so callers do not silently rebase every function entry
+    /// against the bottom of the address space. Mirrors `moduledata.text`.
     pub header_text_start: Option<u64>,
 }
 
@@ -1582,10 +1590,13 @@ fn parse_header(
     };
 
     // The pcHeader gained a `textStart` field at index 2 in Go 1.18; Go
-    // 1.16-1.17 (off_base == 2) do not have it.
+    // 1.16-1.17 (off_base == 2) do not have it, and Go 1.26+ zeroed it out
+    // (see `ParsedPclntab::header_text_start`). `runtime.text` is never 0 in a
+    // real image — even wasm, whose PCs start at 0, carries the value in the
+    // moduledata rather than here — so a zero means "not recorded".
     let header_text_start = if off_base > 2 {
         let off = advance_n(8, 2, ps)?;
-        read_uintptr(data, off, ptr_size)
+        read_uintptr(data, off, ptr_size).filter(|&va| va != 0)
     } else {
         None
     };
@@ -1940,7 +1951,12 @@ mod tests {
             go_module: None,
             typelink: None,
             itablink: None,
+            go_type: None,
+            go_func: None,
             fipsinfo: None,
+            noptrdata: None,
+            data_section: None,
+            text_section: None,
         };
 
         let parsed = scan_relaxed(&data, &sections).unwrap();

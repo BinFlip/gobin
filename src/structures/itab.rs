@@ -219,8 +219,11 @@ fn itab_stride(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> O
         return Some(base);
     }
     let inter_va = read_uintptr(buf, 0, ps_u8)?;
-    let nmethods = interface_method_count(ctx, inter_va, ps_u8).unwrap_or(1);
-    let extra = nmethods.saturating_sub(1).checked_mul(ps)?;
+    // No method count means no stride. Guessing one (the old code assumed a
+    // single method) silently misaligns the rest of the walk and turns every
+    // following record into fabricated itab pairs; the caller stops instead.
+    let nmethods = interface_method_count(ctx, inter_va, ps_u8)?;
+    let extra = nmethods.checked_sub(1)?.checked_mul(ps)?;
     base.checked_add(extra)
 }
 

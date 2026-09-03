@@ -69,50 +69,81 @@ pub fn extract<'a>(ctx: &'a BinaryContext<'a>, ptr_size: u8) -> Vec<EmbeddedAsse
         Some(s) => s,
         None => return Vec::new(),
     };
-    let header_size = match p.checked_mul(3) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
 
     let mut out = Vec::new();
     let mut seen_arrays: Vec<u64> = Vec::new();
 
-    let mut off = 0usize;
-    while let Some(end) = off.checked_add(header_size) {
-        if end > data.len() {
-            break;
-        }
-        // Candidate slice header (ptr, len, cap).
-        if let Some(arr_va) = read_slice_header(data, off, ptr_size, entry_size)
-            && !seen_arrays.contains(&arr_va.0)
-            && let Some(mut assets) =
-                parse_file_array(ctx, arr_va.0, arr_va.1, ptr_size, entry_size)
-        {
-            seen_arrays.push(arr_va.0);
-            out.append(&mut assets);
-        }
-        off = match off.checked_add(p) {
-            Some(o) => o,
-            None => break,
-        };
+    for (from, to) in ctx.search_regions() {
+        scan_region(
+            ctx,
+            data,
+            from,
+            to,
+            ptr_size,
+            entry_size,
+            &mut out,
+            &mut seen_arrays,
+        );
     }
     out
 }
 
-/// Validate a `(ptr, len, cap)` slice-header candidate at `off`. Returns
-/// `(array_va, len)` when it could plausibly be a `[]file` header.
-fn read_slice_header(data: &[u8], off: usize, ps: u8, entry_size: usize) -> Option<(u64, u64)> {
-    let p = ps as usize;
-    let ptr = read_uintptr(data, off, ps)?;
-    let len = read_uintptr(data, off.checked_add(p)?, ps)?;
-    let cap = read_uintptr(data, off.checked_add(p.checked_mul(2)?)?, ps)?;
-    if ptr == 0 || len == 0 || len != cap || len > MAX_ENTRIES_PER_FS {
-        return None;
+/// Scan `[start, end)` for `[]file` slice headers, appending every asset of
+/// every array that validates.
+///
+/// The three words of a `(ptr, len, cap)` header are consecutive, so the walk
+/// keeps a rolling window and reads each word once rather than once per
+/// candidate position, and tests `len`/`cap` — by far the more selective
+/// fields — before looking at the pointer.
+#[allow(clippy::too_many_arguments)]
+fn scan_region<'a>(
+    ctx: &'a BinaryContext<'a>,
+    data: &'a [u8],
+    start: usize,
+    end: usize,
+    ptr_size: u8,
+    entry_size: usize,
+    out: &mut Vec<EmbeddedAsset<'a>>,
+    seen_arrays: &mut Vec<u64>,
+) {
+    let p = ptr_size as usize;
+    let Some(start) = start.checked_next_multiple_of(p) else {
+        return;
+    };
+    let end = end.min(data.len());
+    // Need three words to form a header.
+    let Some(last) = end.checked_sub(p.saturating_mul(3)) else {
+        return;
+    };
+
+    let read = |off: usize| read_uintptr(data, off, ptr_size);
+    let (Some(mut ptr), Some(mut len)) = (read(start), read(start.saturating_add(p))) else {
+        return;
+    };
+
+    let mut off = start;
+    while off <= last {
+        let Some(cap) = read(off.saturating_add(p.saturating_mul(2))) else {
+            return;
+        };
+        if len != 0
+            && len == cap
+            && len <= MAX_ENTRIES_PER_FS
+            && ptr != 0
+            && (len as usize).checked_mul(entry_size).is_some()
+            && !seen_arrays.contains(&ptr)
+            && let Some(mut assets) = parse_file_array(ctx, ptr, len, ptr_size, entry_size)
+        {
+            seen_arrays.push(ptr);
+            out.append(&mut assets);
+        }
+        ptr = len;
+        len = cap;
+        off = match off.checked_add(p) {
+            Some(o) => o,
+            None => return,
+        };
     }
-    // The whole array must fit within addressable bytes; cheap pre-check using
-    // entry_size * len not overflowing.
-    (len as usize).checked_mul(entry_size)?;
-    Some((ptr, len))
 }
 
 /// Parse exactly `count` `file` entries at array VA `arr_va`. Returns `None`
@@ -126,11 +157,14 @@ fn parse_file_array<'a>(
     entry_size: usize,
 ) -> Option<Vec<EmbeddedAsset<'a>>> {
     let p = ps as usize;
-    let mut assets = Vec::with_capacity(count.min(64) as usize);
+    // Deliberately un-reserved: nearly every candidate the scan offers is
+    // rejected on its first entry, and reserving up front would allocate for
+    // each of those only to drop it unused.
+    let mut assets = Vec::new();
     // The embed `files` list is sorted by (dir, base); enforcing strictly
     // increasing order is the decisive filter that rejects the many unrelated
     // `[]string`-shaped tables a blind scan would otherwise match.
-    let mut prev_key: Option<(String, String)> = None;
+    let mut prev_key: Option<(&str, &str)> = None;
     for i in 0..count {
         let entry_off = (i as usize).checked_mul(entry_size)?;
         let entry_va = arr_va.checked_add(entry_off as u64)?;
@@ -167,9 +201,7 @@ fn parse_file_array<'a>(
 
         // Enforce the canonical embed ordering.
         let key = embed_sort_key(path);
-        if let Some(prev) = &prev_key
-            && *prev >= key
-        {
+        if prev_key.is_some_and(|prev| prev >= key) {
             return None;
         }
         prev_key = Some(key);
@@ -189,15 +221,18 @@ fn parse_file_array<'a>(
 /// The `(dir, base)` sort key `embed` orders its file list by.
 ///
 /// Mirrors `embed.split`: strip a trailing `/`, then split at the last
-/// remaining `/` (a missing dir becomes `"."`).
-fn embed_sort_key(name: &str) -> (String, String) {
+/// remaining `/` (a missing dir becomes `"."`). Borrowed from `name` rather
+/// than owned — the key exists only to be compared against its predecessor,
+/// and the blind scan evaluates it for every candidate entry it examines, so
+/// owning it allocated twice per rejected entry.
+fn embed_sort_key(name: &str) -> (&str, &str) {
     let n = name.strip_suffix('/').unwrap_or(name);
     match n.rfind('/') {
         Some(i) => (
-            n.get(..i).unwrap_or(".").to_string(),
-            n.get(i.saturating_add(1)..).unwrap_or("").to_string(),
+            n.get(..i).unwrap_or("."),
+            n.get(i.saturating_add(1)..).unwrap_or(""),
         ),
-        None => (".".to_string(), n.to_string()),
+        None => (".", n),
     }
 }
 

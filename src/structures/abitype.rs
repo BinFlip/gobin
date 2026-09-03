@@ -16,11 +16,14 @@
 //! - `FieldAlign_` (u8)
 //! - `Kind_`       (u8)
 //! - `Equal`       (uintptr, equality function pointer)
-//! - `GCData`      (uintptr, GC bitmap pointer)
+//! - `GCData`      (uintptr, GC pointer-mask bitmap — or a pointer to one; see
+//!   [`TFLAG_GC_MASK_ON_DEMAND`])
 //! - `Str`         (NameOff / i32)
 //! - `PtrToThis`   (TypeOff / i32)
 //!
-//! Source: `src/internal/abi/type.go:21-46`
+//! Source: `src/internal/abi/type.go`. The struct itself has been stable since
+//! Go 1.21; what changed in Go 1.27 is how `GCData` is populated — see
+//! [`TFLAG_GC_MASK_ON_DEMAND`].
 
 use crate::structures::util::{read_i32, read_u32, read_uintptr};
 
@@ -32,6 +35,27 @@ pub const TFLAG_EXTRA_STAR: u8 = 0x02;
 
 /// `TFlag` bit: the type has a user-defined name (not a composite literal type).
 pub const TFLAG_NAMED: u8 = 0x04;
+
+/// `TFlag` bit: the type's `Equal` and hash functions may treat values as plain
+/// memory (`TFlagRegularMemory`).
+pub const TFLAG_REGULAR_MEMORY: u8 = 0x08;
+
+/// `TFlag` bit: `GCData` is **not** a pointer mask but a `**byte` — a slot the
+/// runtime fills in with a lazily-built mask on first use
+/// (`runtime.getGCMaskOnDemand`).
+///
+/// The flag exists from Go 1.22, but its reach changed sharply in Go 1.27:
+/// that release deleted type-level GC *programs* (the `type:.gcprog.*` symbols
+/// became `type:.gcmask.*` under a new `runtime.gcmask.*` BSS carrier) and
+/// dropped `abi.MaxPtrmaskBytes` from 2048 to 16. Below 1.27 almost no type
+/// took the on-demand path; from 1.27 most non-trivial ones do. Check this bit
+/// before treating [`AbiType::gcdata`] as the address of a bitmap.
+pub const TFLAG_GC_MASK_ON_DEMAND: u8 = 0x10;
+
+/// `TFlag` bit: a value of this type is stored directly in an interface word
+/// rather than behind a pointer (`TFlagDirectIface`). Mirrors the legacy
+/// `KindDirectIface` bit in `Kind_`, which `AbiType::kind` masks off.
+pub const TFLAG_DIRECT_IFACE: u8 = 0x20;
 
 /// Parsed `abi.Type` -- the base type descriptor found at the start of every
 /// Go runtime type.
@@ -53,7 +77,13 @@ pub struct AbiType {
     pub kind_: u8,
     /// VA of the type's equality function (`Equal`), or `0` if none.
     pub equal: u64,
-    /// VA of the type's GC bitmap (`GCData`), or `0` if none.
+    /// VA of the type's GC pointer-mask bitmap (`GCData`), or `0` if none.
+    ///
+    /// When [`TFLAG_GC_MASK_ON_DEMAND`] is set this is instead the address of
+    /// a `*byte` slot the runtime populates at run time, so statically it
+    /// points at zeroed BSS rather than at a mask. Use
+    /// [`AbiType::gc_mask_va`] to get the bitmap address only when one is
+    /// actually present.
     pub gcdata: u64,
     /// Offset into the names table for this type's string representation.
     pub str_off: i32,
@@ -139,6 +169,40 @@ impl AbiType {
     /// Whether this type has a user-defined name.
     pub fn is_named(&self) -> bool {
         self.tflag & TFLAG_NAMED != 0
+    }
+
+    /// Whether `Equal`/hash may treat values of this type as plain memory.
+    pub fn is_regular_memory(&self) -> bool {
+        self.tflag & TFLAG_REGULAR_MEMORY != 0
+    }
+
+    /// Whether [`Self::gcdata`] addresses a runtime-populated `*byte` slot
+    /// instead of a statically-emitted pointer mask. See
+    /// [`TFLAG_GC_MASK_ON_DEMAND`].
+    pub fn gc_mask_on_demand(&self) -> bool {
+        self.tflag & TFLAG_GC_MASK_ON_DEMAND != 0
+    }
+
+    /// Whether a value of this type is stored directly in an interface word.
+    ///
+    /// Go carried this as `KindDirectIface` (bit 5 of `Kind_`) before moving it
+    /// into `TFlag`, and still sets both, so either bit is accepted.
+    pub fn is_direct_iface(&self) -> bool {
+        self.tflag & TFLAG_DIRECT_IFACE != 0 || self.kind_ & 0x20 != 0
+    }
+
+    /// VA of this type's statically-emitted GC pointer mask, or `None` when
+    /// the type has none or defers mask construction to run time.
+    ///
+    /// Prefer this over reading [`Self::gcdata`] directly: from Go 1.27 the
+    /// on-demand path is the common case, and the raw field then addresses an
+    /// empty BSS slot rather than a bitmap.
+    pub fn gc_mask_va(&self) -> Option<u64> {
+        if self.gcdata == 0 || self.gc_mask_on_demand() {
+            None
+        } else {
+            Some(self.gcdata)
+        }
     }
 }
 

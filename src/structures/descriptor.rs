@@ -15,7 +15,7 @@ use crate::structures::{
     functype::FuncTypeExtra,
     interfacetype::InterfaceTypeExtra,
     kind,
-    maptype::MapTypeExtra,
+    maptype::{MapLayout, MapTypeExtra},
     method::{GoImethod, GoMethod},
     structtype::{GoStructField, StructTypeExtra},
     uncommon::UncommonType,
@@ -23,10 +23,19 @@ use crate::structures::{
 };
 
 /// Compute the total descriptor size for a type, equivalent to Go's
-/// `abi.Type.DescriptorSize()` from `src/internal/abi/type.go:750-799`.
+/// `abi.Type.DescriptorSize()` from `src/internal/abi/type.go`.
 ///
 /// The total is: concrete_type_size + uncommon_type_size + variable_data + methods.
-pub fn descriptor_size(type_data: &[u8], abi_type: &AbiType, ps: u8) -> Option<usize> {
+///
+/// `map_layout` selects the [`MapTypeExtra`] shape, which changed in both Go
+/// 1.24 and Go 1.27; getting it wrong mis-sizes every map descriptor and, with
+/// it, the position of the trailing `UncommonType`.
+pub fn descriptor_size(
+    type_data: &[u8],
+    abi_type: &AbiType,
+    ps: u8,
+    map_layout: MapLayout,
+) -> Option<usize> {
     let p = ps as usize;
     let base_sz = AbiType::size(ps);
 
@@ -55,7 +64,15 @@ pub fn descriptor_size(type_data: &[u8], abi_type: &AbiType, ps: u8) -> Option<u
                 (extra.methods.len as usize).checked_mul(GoImethod::SIZE)?,
             )
         }
-        kind::MAP => (base_sz.checked_add(MapTypeExtra::size(ps))?, 0),
+        kind::MAP => {
+            // `Probe` has to be resolved against this descriptor's own bytes
+            // before it can be sized.
+            let resolved = map_layout.resolve_for(type_data.get(base_sz..)?, ps);
+            (
+                base_sz.checked_add(MapTypeExtra::size(ps, resolved))?,
+                0usize,
+            )
+        }
         kind::POINTER => (base_sz.checked_add(ElemTypeExtra::size(ps))?, 0),
         kind::SLICE => (base_sz.checked_add(ElemTypeExtra::size(ps))?, 0),
         kind::STRUCT => {
@@ -123,7 +140,7 @@ mod tests {
     fn scalar_type_size() {
         let buf = make_abitype_buf(8, kind::INT, 0);
         let abi = AbiType::parse(&buf, 8).unwrap();
-        let sz = descriptor_size(&buf, &abi, 8).unwrap();
+        let sz = descriptor_size(&buf, &abi, 8, MapLayout::SwissSplitGroup).unwrap();
         assert_eq!(sz, AbiType::size(8));
     }
 
@@ -132,7 +149,7 @@ mod tests {
         let mut buf = make_abitype_buf(8, kind::POINTER, 0);
         buf.extend(vec![0u8; ElemTypeExtra::size(8)]);
         let abi = AbiType::parse(&buf, 8).unwrap();
-        let sz = descriptor_size(&buf, &abi, 8).unwrap();
+        let sz = descriptor_size(&buf, &abi, 8, MapLayout::SwissSplitGroup).unwrap();
         assert_eq!(sz, AbiType::size(8) + ElemTypeExtra::size(8));
     }
 
@@ -140,6 +157,6 @@ mod tests {
     fn unknown_kind_returns_none() {
         let buf = make_abitype_buf(8, 0xFF, 0);
         let abi = AbiType::parse(&buf, 8).unwrap();
-        assert!(descriptor_size(&buf, &abi, 8).is_none());
+        assert!(descriptor_size(&buf, &abi, 8, MapLayout::SwissSplitGroup).is_none());
     }
 }
